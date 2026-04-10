@@ -1,4 +1,6 @@
-# Whisper Dictation Hotkey
+# whisper-maxxing
+
+`whisper-maxxing` is a low-latency local dictation harness for macOS.
 
 Low-latency local dictation for macOS using:
 

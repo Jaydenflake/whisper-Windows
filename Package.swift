@@ -3,7 +3,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "WhisperDictationHotkey",
+    name: "WhisperMaxxing",
     platforms: [
         .macOS(.v14),
     ],
