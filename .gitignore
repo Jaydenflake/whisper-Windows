@@ -2,3 +2,6 @@
 *.swp
 *.tmp
 benchmark-output/
+.build/
+bin/
+docs/benchmarks/

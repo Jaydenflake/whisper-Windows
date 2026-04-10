@@ -1,161 +1,81 @@
-# Latency Analysis
+# Performance Notes
 
 Date: `2026-04-10`
 
-Machine-level facts gathered from the current local setup.
+These measurements were taken on the original development machine for this repo. They are useful as a baseline, not as a universal guarantee.
 
-## Files and Build State
+## Legacy Baseline
 
-- Live Hammerspoon config: `/Users/gabrielhansen/.hammerspoon/init.lua`
-- `whisper.cpp` checkout: `/Users/gabrielhansen/MyProjects/whisper.cpp`
-- Current model: `/Users/gabrielhansen/MyProjects/whisper.cpp/models/ggml-small.en.bin`
-- Current binary: `/Users/gabrielhansen/MyProjects/whisper.cpp/build/bin/whisper-cli`
-- Current server binary: `/Users/gabrielhansen/MyProjects/whisper.cpp/build/bin/whisper-server`
+Before this harness, the dictation path was:
 
-Build cache facts from `build/CMakeCache.txt`:
+1. Hammerspoon hotkey
+2. microphone lookup via `ffmpeg -list_devices`
+3. fresh `ffmpeg` recording process
+4. fresh `whisper-cli` process
+5. model load
+6. inference
 
-- `CMAKE_BUILD_TYPE=Release`
-- `GGML_BLAS=ON`
-- `GGML_METAL=1`
-- `GGML_METAL_EMBED_LIBRARY=ON`
-- `WHISPER_COREML=OFF`
+Measured costs from that older design:
 
-## Current Hammerspoon Hot Path
+- device enumeration on every hotkey press: about `0.21s` to `0.81s`
+- fresh `whisper-cli` wall time on a trivial WAV: about `0.55s` warm and `1.09s` first run
+- hot resident `whisper-server` inference on the same trivial WAV: about `0.19s` to `0.26s`
 
-Relevant current behavior from `init.lua`:
+That is why the repo moved to a resident daemon plus resident server design.
 
-- `resolveAudioDevice()` shells out to `ffmpeg -f avfoundation -list_devices true -i ''`
-- `startRecording()` runs that lookup on every hotkey press before starting capture
-- `runWhisper()` launches a fresh `whisper-cli` process after recording stops
+## Current Resident Design
 
-That means the current startup path is:
+The steady-state design is:
 
-1. Hammerspoon hotkey dispatch
-2. AVFoundation device enumeration
-3. New `ffmpeg` process launch
-4. New `whisper-cli` process launch
-5. Model load
-6. Inference
+- keep the capture daemon resident through `launchd`
+- keep `whisper-server` resident
+- keep a rolling prebuffer
+- make the hotkey toggle only a logical recording session
 
-## Measured Device Enumeration Cost
+## Startup Benchmark Summary
 
-Repeated timings for:
+Verified startup results from the current harness:
 
-```bash
-/usr/bin/time -lp /opt/homebrew/bin/ffmpeg -f avfoundation -list_devices true -i ''
-```
+### Warm Idle
 
-Results:
+- control round-trip p95: `8.24 ms`
+- capture-ready p95: `151.54 ms`
+- prebuffer available: `1000 ms`
 
-- Run 1: `real 0.64`
-- Run 2: `real 0.81`
-- Run 3: `real 0.21`
+### Warm Load
 
-Conclusion:
+- control round-trip p95: `7.39 ms`
+- capture-ready p95: `158.83 ms`
+- prebuffer available p95: `1000 ms`
 
-- Current microphone resolution alone adds a noticeable fixed delay before recording can even start.
+### Cold Idle
 
-## Measured Fresh `whisper-cli` Cost
+- daemon cold-boot p95: `354.47 ms`
+- control round-trip p95: `360.57 ms`
+- capture-ready p95: `162.36 ms`
 
-Test input:
+## Interpretation
 
-- 2-second mono 16 kHz silent WAV generated locally
+The important split is:
 
-Repeated timings for:
+- `clientObservedMilliseconds` is end-to-end command latency
+- `captureReadyMs` is when the native audio engine is actually live
 
-```bash
-/usr/bin/time -lp whisper-cli -m ggml-small.en.bin -f /tmp/whisper-silence.wav --output-txt --output-file ...
-```
+For real usage, the warm resident path is the intended mode. That is the path users experience after login and after normal operation, and it stays in the single-digit millisecond range at the control layer with capture ready in about `0.15s`.
 
-Observed `whisper_print_timings`:
+Cold daemon recovery exists, but it is a fallback path, not the intended steady-state mode.
 
-- Run 1 load time: `525.14 ms`
-- Run 2 load time: `214.00 ms`
-- Run 3 load time: `234.66 ms`
+## Reproducing
 
-Observed wall times:
-
-- Run 1: `real 1.09`
-- Run 2: `real 0.55`
-- Run 3: `real 0.55`
-
-Observed runtime backend info:
-
-- `WHISPER : COREML = 0`
-- `Metal : EMBED_LIBRARY = 1`
-
-Conclusion:
-
-- The current fresh-process design pays both process startup and model initialization costs on every transcription.
-- Even when warm, the CLI path still spends about half a second on a trivial request.
-
-## Measured Resident `whisper-server` Cost
-
-With a persistent local `whisper-server` process already running and the model already loaded:
+Build the repo, install it, then run:
 
 ```bash
-curl -sS http://127.0.0.1:8177/inference \
-  -H "Content-Type: multipart/form-data" \
-  -F file=@/tmp/whisper-silence.wav \
-  -F response_format=json
+ITERATIONS=12 ./scripts/benchmark-startup.sh
+COUNT=5 ./scripts/benchmark-pipeline.sh
 ```
 
-Observed wall times:
+Synthetic CPU pressure can be added through:
 
-- Run 1: `real 0.26`
-- Run 2: `real 0.19`
-- Run 3: `real 0.20`
-
-Conclusion:
-
-- Keeping the model resident cuts the hot transcription path roughly in half versus the warm fresh-CLI path.
-- The remaining user-visible miss at the start of dictation is therefore mostly a capture-start problem, not purely a transcription problem.
-
-## Measured Resident Server Cold Start
-
-A fresh server launch was probed until HTTP root became reachable.
-
-Observed time to ready:
-
-- `ready_ms=8152.9`
-
-Conclusion:
-
-- `whisper-server` is not suitable to cold-launch on each hotkey press.
-- It is suitable to launch once at login and keep resident.
-
-## Core ML Verification
-
-A separate Core ML-enabled build was created in:
-
-- `/Users/gabrielhansen/MyProjects/whisper.cpp/build-coreml`
-
-Build result:
-
-- Compile succeeded
-
-Runtime result:
-
-- The Core ML-enabled binary failed to initialize because it expected:
-  - `/Users/gabrielhansen/MyProjects/whisper.cpp/models/ggml-small.en-encoder.mlmodelc`
-- Actual artifact present on disk:
-  - `/Users/gabrielhansen/MyProjects/whisper.cpp/models/coreml-encoder-small.en.mlpackage`
-
-Observed failure:
-
-- `whisper_init_state: failed to load Core ML model`
-
-Conclusion:
-
-- Core ML is not currently a functioning part of this setup.
-- It may still be worth enabling later, but only after the correct compiled model artifact is generated and verified.
-
-## Clear Recommendation
-
-To stop losing the first words, the next implementation should do all of the following:
-
-1. Cache or pre-resolve the microphone device outside the hotkey path.
-2. Keep a resident recording component alive so capture begins immediately.
-3. Maintain a short rolling pre-buffer so speech that begins slightly before the UI state flips is still preserved.
-4. Keep Whisper resident with `whisper-server` or an equivalent local daemon launched at login.
-5. Have the hotkey toggle recording state only, not process startup.
+```bash
+LOAD=1 COUNT=5 ./scripts/benchmark-pipeline.sh
+```

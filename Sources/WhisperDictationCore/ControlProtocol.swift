@@ -1,0 +1,110 @@
+import Foundation
+
+public enum ControlCommand: String, Codable, Sendable {
+    case warmup
+    case start
+    case stop
+    case cancel
+    case nextResult
+    case status
+    case shutdown
+}
+
+public struct ControlRequest: Codable, Sendable {
+    public let command: ControlCommand
+
+    public init(command: ControlCommand) {
+        self.command = command
+    }
+}
+
+public struct SessionMetrics: Codable, Sendable {
+    public let sessionId: String
+    public let prebufferMilliseconds: Double
+    public let audioDurationMilliseconds: Double
+    public let transcriptionMode: String?
+    public let transcriptionMilliseconds: Double?
+    public let queueWaitMilliseconds: Double?
+    public let completedAtISO8601: String?
+
+    public init(
+        sessionId: String,
+        prebufferMilliseconds: Double,
+        audioDurationMilliseconds: Double,
+        transcriptionMode: String?,
+        transcriptionMilliseconds: Double?,
+        queueWaitMilliseconds: Double?,
+        completedAtISO8601: String?
+    ) {
+        self.sessionId = sessionId
+        self.prebufferMilliseconds = prebufferMilliseconds
+        self.audioDurationMilliseconds = audioDurationMilliseconds
+        self.transcriptionMode = transcriptionMode
+        self.transcriptionMilliseconds = transcriptionMilliseconds
+        self.queueWaitMilliseconds = queueWaitMilliseconds
+        self.completedAtISO8601 = completedAtISO8601
+    }
+}
+
+public struct SessionResultPayload: Codable, Sendable {
+    public let sessionId: String
+    public let text: String
+    public let metrics: SessionMetrics
+    public let salvagePath: String?
+
+    public init(sessionId: String, text: String, metrics: SessionMetrics, salvagePath: String?) {
+        self.sessionId = sessionId
+        self.text = text
+        self.metrics = metrics
+        self.salvagePath = salvagePath
+    }
+}
+
+public struct StatusPayload: Codable, Sendable {
+    public let recording: Bool
+    public let pendingCount: Int
+    public let engineReady: Bool
+    public let engineStartupMilliseconds: Double?
+    public let prebufferAvailableMilliseconds: Double
+    public let preferredInputDevice: String?
+    public let defaultInputDevice: String?
+    public let serverState: String
+
+    public init(
+        recording: Bool,
+        pendingCount: Int,
+        engineReady: Bool,
+        engineStartupMilliseconds: Double?,
+        prebufferAvailableMilliseconds: Double,
+        preferredInputDevice: String?,
+        defaultInputDevice: String?,
+        serverState: String
+    ) {
+        self.recording = recording
+        self.pendingCount = pendingCount
+        self.engineReady = engineReady
+        self.engineStartupMilliseconds = engineStartupMilliseconds
+        self.prebufferAvailableMilliseconds = prebufferAvailableMilliseconds
+        self.preferredInputDevice = preferredInputDevice
+        self.defaultInputDevice = defaultInputDevice
+        self.serverState = serverState
+    }
+}
+
+public struct ControlResponse: Codable, Sendable {
+    public var ok: Bool
+    public var error: String?
+    public var recording: Bool?
+    public var pendingCount: Int?
+    public var sessionId: String?
+    public var resultAvailable: Bool?
+    public var result: SessionResultPayload?
+    public var status: StatusPayload?
+    public var clientObservedMilliseconds: Double?
+    public var coldBootMilliseconds: Double?
+
+    public init(ok: Bool, error: String? = nil) {
+        self.ok = ok
+        self.error = error
+    }
+}
