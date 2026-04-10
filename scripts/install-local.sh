@@ -4,6 +4,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HOME_DIR="${HOME}"
+PREFERRED_INPUT_DEVICE_EXPLICIT="${PREFERRED_INPUT_DEVICE+x}"
+ENFORCE_PREFERRED_INPUT_DEVICE_EXPLICIT="${ENFORCE_PREFERRED_INPUT_DEVICE+x}"
 APP_SUPPORT_DIR="$HOME_DIR/Library/Application Support/WhisperDictation"
 CACHE_DIR="${CACHE_DIR:-$HOME_DIR/Library/Caches/WhisperDictation}"
 LOG_DIR="${LOG_DIR:-$HOME_DIR/Library/Logs/WhisperDictation}"
@@ -99,10 +101,65 @@ assert_bool() {
   esac
 }
 
+read_existing_config_value() {
+  local key="$1"
+  python3 - "$CONFIG_PATH" "$key" <<'PY'
+import json
+import pathlib
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+key = sys.argv[2]
+if not config_path.exists():
+    raise SystemExit(0)
+try:
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+value = payload.get(key)
+if value is None:
+    raise SystemExit(0)
+if isinstance(value, bool):
+    print("true" if value else "false")
+else:
+    print(value)
+PY
+}
+
+detect_default_input_device() {
+  system_profiler SPAudioDataType 2>/dev/null | python3 - <<'PY'
+import sys
+
+lines = sys.stdin.read().splitlines()
+current = None
+for raw in lines:
+    line = raw.rstrip()
+    stripped = line.strip()
+    if not stripped:
+        continue
+    if raw.startswith("        ") and stripped.endswith(":") and not stripped.startswith(("Input ", "Output ", "Current ", "Transport", "Manufacturer", "Default ", "Input Source", "Output Source")):
+        current = stripped[:-1]
+        continue
+    if current and stripped == "Default Input Device: Yes":
+        print(current)
+        break
+PY
+}
+
 WHISPER_CPP_ROOT="$(resolve_whisper_cpp_root)"
 WHISPER_SERVER_BINARY="${WHISPER_SERVER_BINARY:-$WHISPER_CPP_ROOT/build/bin/whisper-server}"
 WHISPER_CLI_BINARY="${WHISPER_CLI_BINARY:-$WHISPER_CPP_ROOT/build/bin/whisper-cli}"
 WHISPER_MODEL_PATH="$(resolve_model_path "$WHISPER_CPP_ROOT")"
+
+if [[ -z "$PREFERRED_INPUT_DEVICE" ]]; then
+  PREFERRED_INPUT_DEVICE="$(read_existing_config_value preferredInputDevice || true)"
+fi
+if [[ -z "$PREFERRED_INPUT_DEVICE" ]]; then
+  PREFERRED_INPUT_DEVICE="$(detect_default_input_device || true)"
+fi
+if [[ -n "$PREFERRED_INPUT_DEVICE" && -z "${ENFORCE_PREFERRED_INPUT_DEVICE_EXPLICIT:-}" ]]; then
+  ENFORCE_PREFERRED_INPUT_DEVICE=true
+fi
 
 [[ -x "$WHISPER_SERVER_BINARY" ]] || fail "whisper-server not found at $WHISPER_SERVER_BINARY"
 [[ -x "$WHISPER_CLI_BINARY" ]] || fail "whisper-cli not found at $WHISPER_CLI_BINARY"
