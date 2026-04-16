@@ -6,8 +6,11 @@ final class WhisperDictationDaemon: @unchecked Sendable {
     private let paths: AppPaths
     private let captureEngine: AudioCaptureEngine
     private let completedLock = NSLock()
+    private let shutdownLock = NSLock()
     private var completedResults = [SessionResultPayload]()
     private var server: JSONSocketServer?
+    private var signalSources = [DispatchSourceSignal]()
+    private var shuttingDown = false
     private lazy var transcriptionManager: TranscriptionManager = {
         TranscriptionManager(config: config, paths: paths) { [weak self] result in
             self?.storeCompleted(result)
@@ -33,6 +36,7 @@ final class WhisperDictationDaemon: @unchecked Sendable {
         }
         self.server = server
         try server.start()
+        installSignalHandlers()
         dispatchMain()
     }
 
@@ -109,16 +113,15 @@ final class WhisperDictationDaemon: @unchecked Sendable {
 
     private func handleShutdown() -> ControlResponse {
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { [weak self] in
-            self?.server?.stop()
-            self?.captureEngine.stop()
-            exit(EXIT_SUCCESS)
+            self?.shutdownAndExit(code: EXIT_SUCCESS)
         }
 
         return ControlResponse(ok: true)
     }
 
     private func makeStatusPayload(recording: Bool) -> StatusPayload {
-        StatusPayload(
+        let diskStatus = DiskSpaceMonitor.currentStatus(for: paths.tempDirectoryURL.path)
+        return StatusPayload(
             recording: recording,
             pendingCount: transcriptionManager.pendingCount(),
             engineReady: true,
@@ -126,7 +129,9 @@ final class WhisperDictationDaemon: @unchecked Sendable {
             prebufferAvailableMilliseconds: captureEngine.prebufferAvailableMilliseconds(),
             preferredInputDevice: config.preferredInputDevice,
             defaultInputDevice: captureEngine.defaultInputDeviceName,
-            serverState: transcriptionManager.currentServerState()
+            serverState: transcriptionManager.currentServerState(),
+            availableDiskSpaceBytes: diskStatus?.availableBytes,
+            lowDiskSpaceMessage: lowDiskSpaceMessage(from: diskStatus)
         )
     }
 
@@ -134,5 +139,40 @@ final class WhisperDictationDaemon: @unchecked Sendable {
         completedLock.lock()
         completedResults.append(result)
         completedLock.unlock()
+    }
+
+    private func installSignalHandlers() {
+        for signal in [SIGTERM, SIGINT] {
+            Darwin.signal(signal, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: signal, queue: .global())
+            source.setEventHandler { [weak self] in
+                self?.shutdownAndExit(code: EXIT_SUCCESS)
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
+    private func shutdownAndExit(code: Int32) {
+        shutdownLock.lock()
+        if shuttingDown {
+            shutdownLock.unlock()
+            return
+        }
+        shuttingDown = true
+        shutdownLock.unlock()
+
+        server?.stop()
+        transcriptionManager.stop()
+        captureEngine.stop()
+        exit(code)
+    }
+
+    private func lowDiskSpaceMessage(from diskStatus: DiskSpaceStatus?) -> String? {
+        guard let diskStatus, diskStatus.lowSpace else {
+            return nil
+        }
+
+        return "Disk Almost Full (\(diskStatus.summary) free)"
     }
 }

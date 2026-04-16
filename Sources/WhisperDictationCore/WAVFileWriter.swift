@@ -1,11 +1,10 @@
 import Foundation
 
 public enum WAVFileWriter {
-    public static func writeMono16BitPCM(
+    public static func mono16BitPCMData(
         samples: [Int16],
-        sampleRate: Int,
-        to url: URL
-    ) throws {
+        sampleRate: Int
+    ) -> Data {
         let channels: UInt16 = 1
         let bitsPerSample: UInt16 = 16
         let byteRate = UInt32(sampleRate) * UInt32(channels) * UInt32(bitsPerSample / 8)
@@ -33,7 +32,15 @@ public enum WAVFileWriter {
         }
         data.append(pcmData)
 
-        try data.write(to: url, options: .atomic)
+        return data
+    }
+
+    public static func writeMono16BitPCM(
+        samples: [Int16],
+        sampleRate: Int,
+        to url: URL
+    ) throws {
+        try mono16BitPCMData(samples: samples, sampleRate: sampleRate).write(to: url, options: .atomic)
     }
 
     private static func littleEndian<T: FixedWidthInteger>(_ value: T) -> Data {

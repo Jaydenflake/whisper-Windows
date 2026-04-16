@@ -51,12 +51,20 @@ public struct SessionResultPayload: Codable, Sendable {
     public let text: String
     public let metrics: SessionMetrics
     public let salvagePath: String?
+    public let errorMessage: String?
 
-    public init(sessionId: String, text: String, metrics: SessionMetrics, salvagePath: String?) {
+    public init(
+        sessionId: String,
+        text: String,
+        metrics: SessionMetrics,
+        salvagePath: String?,
+        errorMessage: String?
+    ) {
         self.sessionId = sessionId
         self.text = text
         self.metrics = metrics
         self.salvagePath = salvagePath
+        self.errorMessage = errorMessage
     }
 }
 
@@ -69,6 +77,8 @@ public struct StatusPayload: Codable, Sendable {
     public let preferredInputDevice: String?
     public let defaultInputDevice: String?
     public let serverState: String
+    public let availableDiskSpaceBytes: Int64?
+    public let lowDiskSpaceMessage: String?
 
     public init(
         recording: Bool,
@@ -78,7 +88,9 @@ public struct StatusPayload: Codable, Sendable {
         prebufferAvailableMilliseconds: Double,
         preferredInputDevice: String?,
         defaultInputDevice: String?,
-        serverState: String
+        serverState: String,
+        availableDiskSpaceBytes: Int64?,
+        lowDiskSpaceMessage: String?
     ) {
         self.recording = recording
         self.pendingCount = pendingCount
@@ -88,6 +100,8 @@ public struct StatusPayload: Codable, Sendable {
         self.preferredInputDevice = preferredInputDevice
         self.defaultInputDevice = defaultInputDevice
         self.serverState = serverState
+        self.availableDiskSpaceBytes = availableDiskSpaceBytes
+        self.lowDiskSpaceMessage = lowDiskSpaceMessage
     }
 }
 
