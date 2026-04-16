@@ -4,6 +4,7 @@ import WhisperDictationCore
 enum CLIError: Error, LocalizedError {
     case unknownCommand(String)
     case daemonDidNotStart
+    case launchAgentStartFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -11,6 +12,8 @@ enum CLIError: Error, LocalizedError {
             return "Unknown command '\(command)'"
         case .daemonDidNotStart:
             return "The dictation daemon did not start in time."
+        case .launchAgentStartFailed(let details):
+            return details
         }
     }
 }
@@ -114,26 +117,28 @@ func daemonIsReachable(config: AppConfig) -> Bool {
 
 func launchDaemon(config: AppConfig) throws {
     if FileManager.default.fileExists(atPath: launchAgentPlistPath) {
-        let launchctl = Process()
-        launchctl.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-        launchctl.arguments = [
-            "kickstart",
-            "-k",
-            "gui/\(getuid())/\(launchAgentLabel)",
-        ]
-        try? launchctl.run()
-        launchctl.waitUntilExit()
-        if launchctl.terminationStatus == 0 {
-            let deadline = Date().addingTimeInterval(0.75)
-            while Date() < deadline {
-                if daemonIsReachable(config: config) {
-                    return
-                }
-                Thread.sleep(forTimeInterval: 0.05)
-            }
-        }
+        try launchDaemonViaLaunchAgent()
+        return
     }
 
+    try launchStandaloneDaemon(config: config)
+}
+
+func launchDaemonViaLaunchAgent() throws {
+    let domain = "gui/\(getuid())"
+    let service = "\(domain)/\(launchAgentLabel)"
+
+    do {
+        try runLaunchctl(["kickstart", "-k", service])
+        return
+    } catch {
+        try? runLaunchctl(["bootout", service])
+        try? runLaunchctl(["bootout", domain, launchAgentPlistPath])
+        try runLaunchctl(["bootstrap", domain, launchAgentPlistPath])
+    }
+}
+
+func launchStandaloneDaemon(config: AppConfig) throws {
     let daemonURL = URL(fileURLWithPath: config.daemonBinaryPath)
     let process = Process()
     process.executableURL = daemonURL
@@ -152,4 +157,25 @@ func launchDaemon(config: AppConfig) throws {
     process.standardError = logHandle
 
     try process.run()
+}
+
+func runLaunchctl(_ arguments: [String]) throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+    process.arguments = arguments
+
+    let stderrPipe = Pipe()
+    process.standardError = stderrPipe
+
+    try process.run()
+    process.waitUntilExit()
+
+    guard process.terminationStatus == 0 else {
+        let stderr = String(
+            data: stderrPipe.fileHandleForReading.readDataToEndOfFile(),
+            encoding: .utf8
+        )?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let details = stderr.isEmpty ? "launchctl \(arguments.joined(separator: " ")) failed" : stderr
+        throw CLIError.launchAgentStartFailed(details)
+    }
 }
