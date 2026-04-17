@@ -11,6 +11,7 @@ public struct AppConfig: Codable, Sendable {
     public let whisperServerBinary: String
     public let whisperCliBinary: String
     public let whisperModelPath: String
+    public let whisperVADModelPath: String?
     public let whisperServerHost: String
     public let whisperServerPort: Int
     public let tempDirectory: String

@@ -150,6 +150,7 @@ WHISPER_CPP_ROOT="$(resolve_whisper_cpp_root)"
 WHISPER_SERVER_BINARY="${WHISPER_SERVER_BINARY:-$WHISPER_CPP_ROOT/build/bin/whisper-server}"
 WHISPER_CLI_BINARY="${WHISPER_CLI_BINARY:-$WHISPER_CPP_ROOT/build/bin/whisper-cli}"
 WHISPER_MODEL_PATH="$(resolve_model_path "$WHISPER_CPP_ROOT")"
+WHISPER_VAD_MODEL_PATH="${WHISPER_VAD_MODEL_PATH:-}"
 
 if [[ -z "$PREFERRED_INPUT_DEVICE" ]]; then
   PREFERRED_INPUT_DEVICE="$(read_existing_config_value preferredInputDevice || true)"
@@ -173,6 +174,7 @@ export CONTROL_HOST CONTROL_PORT WHISPER_SERVER_HOST WHISPER_SERVER_PORT
 export PREBUFFER_MILLISECONDS AUDIO_BUFFER_SIZE_FRAMES POLL_INTERVAL_MILLISECONDS
 export WARM_SERVER_ON_LAUNCH WHISPER_THREADS PREFERRED_INPUT_DEVICE ENFORCE_PREFERRED_INPUT_DEVICE
 export WHISPER_SERVER_BINARY WHISPER_CLI_BINARY WHISPER_MODEL_PATH
+export WHISPER_VAD_MODEL_PATH
 
 "$ROOT/scripts/build-release.sh"
 
@@ -185,6 +187,7 @@ import sys
 
 config_path = sys.argv[1]
 preferred = os.environ.get("PREFERRED_INPUT_DEVICE", "").strip()
+vad_model = os.environ.get("WHISPER_VAD_MODEL_PATH", "").strip()
 config = {
     "controlHost": os.environ["CONTROL_HOST"],
     "controlPort": int(os.environ["CONTROL_PORT"]),
@@ -196,6 +199,7 @@ config = {
     "whisperServerBinary": os.environ["WHISPER_SERVER_BINARY"],
     "whisperCliBinary": os.environ["WHISPER_CLI_BINARY"],
     "whisperModelPath": os.environ["WHISPER_MODEL_PATH"],
+    "whisperVADModelPath": vad_model or None,
     "whisperServerHost": os.environ["WHISPER_SERVER_HOST"],
     "whisperServerPort": int(os.environ["WHISPER_SERVER_PORT"]),
     "tempDirectory": os.environ["CACHE_DIR"],

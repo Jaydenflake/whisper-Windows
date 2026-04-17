@@ -22,8 +22,14 @@ private enum ServerState: String {
 }
 
 private enum TranscriptOutcome {
-    case text(String)
+    case text(String, TranscriptDiagnostic?)
     case noSpeech
+}
+
+private struct TranscriptDiagnostic {
+    let reason: String
+    let rawTranscript: String
+    let cleanedTranscript: String
 }
 
 private enum TranscriptionError: LocalizedError {
@@ -47,6 +53,16 @@ private enum TranscriptionError: LocalizedError {
 }
 
 final class TranscriptionManager: @unchecked Sendable {
+    private static let vadActivationDurationMilliseconds = 15_000.0
+    private static let vadMinSilenceDurationMilliseconds = 350
+    private static let vadSpeechPadMilliseconds = 80
+    private static let inlinePlaceholderRegex = try! NSRegularExpression(
+        pattern: #"[\[\(]\s*(?:BLANK[\s_-]*AUDIO|NO[\s_-]*SPEECH|NOSPEECH|SILENCE)\s*[\]\)]"#,
+        options: [.caseInsensitive]
+    )
+    private static let repeatedSpacesRegex = try! NSRegularExpression(pattern: #"[ \t]{2,}"#)
+    private static let spaceBeforePunctuationRegex = try! NSRegularExpression(pattern: #"[ \t]+([,.;:!?])"#)
+
     private let config: AppConfig
     private let paths: AppPaths
     private let onCompleted: @Sendable (SessionResultPayload) -> Void
@@ -151,10 +167,12 @@ final class TranscriptionManager: @unchecked Sendable {
 
         do {
             switch try transcribeViaServerWithRecovery(pending) {
-            case .text(let text):
+            case .text(let text, let diagnostic):
+                let salvagePath = diagnostic.flatMap { self.persistSalvage(for: pending, transcriptDiagnostic: $0) }
                 return completedResult(
                     for: pending.capture,
                     text: text,
+                    salvagePath: salvagePath,
                     transcriptionMode: "server",
                     start: start,
                     queueWaitMs: queueWaitMs
@@ -171,10 +189,12 @@ final class TranscriptionManager: @unchecked Sendable {
 
                 do {
                     switch try transcribeViaCLI(pending) {
-                    case .text(let text):
+                    case .text(let text, let diagnostic):
+                        let salvagePath = diagnostic.flatMap { self.persistSalvage(for: pending, transcriptDiagnostic: $0) }
                         return completedResult(
                             for: pending.capture,
                             text: text,
+                            salvagePath: salvagePath,
                             transcriptionMode: "cli",
                             start: start,
                             queueWaitMs: queueWaitMs
@@ -203,10 +223,12 @@ final class TranscriptionManager: @unchecked Sendable {
         } catch let serverError {
             do {
                 switch try transcribeViaCLI(pending) {
-                case .text(let text):
+                case .text(let text, let diagnostic):
+                    let salvagePath = diagnostic.flatMap { self.persistSalvage(for: pending, transcriptDiagnostic: $0) }
                     return completedResult(
                         for: pending.capture,
                         text: text,
+                        salvagePath: salvagePath,
                         transcriptionMode: "cli",
                         start: start,
                         queueWaitMs: queueWaitMs
@@ -232,6 +254,7 @@ final class TranscriptionManager: @unchecked Sendable {
     private func completedResult(
         for capture: StoppedCapture,
         text: String,
+        salvagePath: String?,
         transcriptionMode: String,
         start: Date,
         queueWaitMs: Double
@@ -250,7 +273,7 @@ final class TranscriptionManager: @unchecked Sendable {
             sessionId: capture.sessionId,
             text: text,
             metrics: metrics,
-            salvagePath: nil,
+            salvagePath: salvagePath,
             errorMessage: nil
         )
     }
@@ -348,6 +371,9 @@ final class TranscriptionManager: @unchecked Sendable {
             "--port", String(config.whisperServerPort),
             "-t", String(config.whisperThreads),
         ]
+        if let vadModelPath = resolvedVADModelPath() {
+            process.arguments?.append(contentsOf: ["-vm", vadModelPath])
+        }
 
         let logHandle = try ensureWritableLog(at: paths.whisperServerLogURL)
         process.standardOutput = logHandle
@@ -368,22 +394,25 @@ final class TranscriptionManager: @unchecked Sendable {
     }
 
     private func transcribeViaServerWithRecovery(_ pending: PendingTranscription) throws -> TranscriptOutcome {
+        let useVAD = shouldUseVAD(for: pending.capture)
         do {
             try ensureServerReady(timeout: 15.0)
             return try transcribeViaServer(
                 wavData: pending.wavData,
-                filename: pending.wavURL.lastPathComponent
+                filename: pending.wavURL.lastPathComponent,
+                useVAD: useVAD
             )
         } catch {
             try restartServer()
             return try transcribeViaServer(
                 wavData: pending.wavData,
-                filename: pending.wavURL.lastPathComponent
+                filename: pending.wavURL.lastPathComponent,
+                useVAD: useVAD
             )
         }
     }
 
-    private func transcribeViaServer(wavData: Data, filename: String) throws -> TranscriptOutcome {
+    private func transcribeViaServer(wavData: Data, filename: String, useVAD: Bool) throws -> TranscriptOutcome {
         let boundary = "Boundary-\(UUID().uuidString)"
         var request = URLRequest(
             url: URL(string: "http://\(config.whisperServerHost):\(config.whisperServerPort)/inference")!
@@ -395,6 +424,23 @@ final class TranscriptionManager: @unchecked Sendable {
         body.append(multipartField(name: "response_format", value: "json", boundary: boundary))
         body.append(multipartField(name: "no_timestamps", value: "true", boundary: boundary))
         body.append(multipartField(name: "temperature", value: "0.0", boundary: boundary))
+        if useVAD {
+            body.append(multipartField(name: "vad", value: "true", boundary: boundary))
+            body.append(
+                multipartField(
+                    name: "vad_min_silence_duration_ms",
+                    value: String(Self.vadMinSilenceDurationMilliseconds),
+                    boundary: boundary
+                )
+            )
+            body.append(
+                multipartField(
+                    name: "vad_speech_pad_ms",
+                    value: String(Self.vadSpeechPadMilliseconds),
+                    boundary: boundary
+                )
+            )
+        }
         body.append(
             multipartFile(
                 name: "file",
@@ -450,6 +496,14 @@ final class TranscriptionManager: @unchecked Sendable {
             "-np",
             "-t", String(config.whisperThreads),
         ]
+        if shouldUseVAD(for: pending.capture), let vadModelPath = resolvedVADModelPath() {
+            process.arguments?.append(contentsOf: [
+                "--vad",
+                "-vm", vadModelPath,
+                "-vsd", String(Self.vadMinSilenceDurationMilliseconds),
+                "-vp", String(Self.vadSpeechPadMilliseconds),
+            ])
+        }
 
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
@@ -540,36 +594,63 @@ final class TranscriptionManager: @unchecked Sendable {
             return .noSpeech
         }
 
-        let marker = trimmed
-            .uppercased()
-            .replacingOccurrences(of: " ", with: "")
-            .replacingOccurrences(of: "_", with: "")
-            .replacingOccurrences(of: "-", with: "")
-
-        if [
-            "[BLANKAUDIO]",
-            "(BLANKAUDIO)",
-            "[NOSPEECH]",
-            "(NOSPEECH)",
-            "[SILENCE]",
-            "(SILENCE)",
-        ].contains(marker) {
+        if isStandalonePlaceholderMarker(trimmed) {
             return .noSpeech
         }
 
-        guard trimmed.rangeOfCharacter(from: .alphanumerics) != nil else {
+        let stripped = stripPlaceholderArtifacts(from: trimmed)
+        let normalized = stripped.hadPlaceholderArtifacts ? stripped.cleanedTranscript : trimmed
+
+        guard !normalized.isEmpty else {
             return .noSpeech
         }
 
-        return .text(trimmed)
+        guard normalized.rangeOfCharacter(from: .alphanumerics) != nil else {
+            return .noSpeech
+        }
+
+        if stripped.hadPlaceholderArtifacts {
+            return .text(
+                normalized,
+                TranscriptDiagnostic(
+                    reason: "inline-placeholder-artifacts",
+                    rawTranscript: trimmed,
+                    cleanedTranscript: normalized
+                )
+            )
+        }
+
+        return .text(normalized, nil)
     }
 
-    private func persistSalvage(for pending: PendingTranscription) -> String? {
+    private func persistSalvage(
+        for pending: PendingTranscription,
+        transcriptDiagnostic: TranscriptDiagnostic? = nil
+    ) -> String? {
         let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-        let salvageURL = paths.salvageDirectoryURL.appendingPathComponent("whisper-\(stamp)-\(pending.capture.sessionId).wav")
+        let baseName = "whisper-\(stamp)-\(pending.capture.sessionId)"
+        let salvageURL = paths.salvageDirectoryURL.appendingPathComponent("\(baseName).wav")
 
         do {
             try pending.wavData.write(to: salvageURL, options: .atomic)
+            if let transcriptDiagnostic {
+                let diagnosticsURL = paths.salvageDirectoryURL.appendingPathComponent("\(baseName)-diagnostics.txt")
+                let contents = """
+                reason: \(transcriptDiagnostic.reason)
+                session_id: \(pending.capture.sessionId)
+
+                raw transcript:
+                \(transcriptDiagnostic.rawTranscript)
+
+                cleaned transcript:
+                \(transcriptDiagnostic.cleanedTranscript)
+                """
+                try contents.write(to: diagnosticsURL, atomically: true, encoding: .utf8)
+                fputs(
+                    "whisper-dictation-daemon: placeholder artifacts detected; saved diagnostics to \(diagnosticsURL.path)\n",
+                    stderr
+                )
+            }
             return salvageURL.path
         } catch {
             fputs(
@@ -619,5 +700,82 @@ final class TranscriptionManager: @unchecked Sendable {
 
         let description = nsError.localizedDescription.lowercased()
         return description.contains("no space") || description.contains("disk is full")
+    }
+
+    private func resolvedVADModelPath() -> String? {
+        let fm = FileManager.default
+
+        guard let configured = config.whisperVADModelPath, !configured.isEmpty else {
+            return nil
+        }
+
+        if fm.isReadableFile(atPath: configured) {
+            return configured
+        }
+
+        fputs("whisper-dictation-daemon: configured VAD model is not readable: \(configured)\n", stderr)
+        return nil
+    }
+
+    private func shouldUseVAD(for capture: StoppedCapture) -> Bool {
+        guard resolvedVADModelPath() != nil else {
+            return false
+        }
+
+        return (Double(capture.samples.count) / 16.0) >= Self.vadActivationDurationMilliseconds
+    }
+
+    private func isStandalonePlaceholderMarker(_ text: String) -> Bool {
+        let marker = text
+            .uppercased()
+            .replacingOccurrences(of: " ", with: "")
+            .replacingOccurrences(of: "_", with: "")
+            .replacingOccurrences(of: "-", with: "")
+
+        return [
+            "[BLANKAUDIO]",
+            "(BLANKAUDIO)",
+            "[NOSPEECH]",
+            "(NOSPEECH)",
+            "[SILENCE]",
+            "(SILENCE)",
+        ].contains(marker)
+    }
+
+    private func stripPlaceholderArtifacts(from text: String) -> (cleanedTranscript: String, hadPlaceholderArtifacts: Bool) {
+        let range = NSRange(text.startIndex..., in: text)
+        let hadPlaceholderArtifacts = Self.inlinePlaceholderRegex.firstMatch(in: text, range: range) != nil
+        guard hadPlaceholderArtifacts else {
+            return (text, false)
+        }
+
+        let withoutMarkers = Self.inlinePlaceholderRegex.stringByReplacingMatches(
+            in: text,
+            range: range,
+            withTemplate: " "
+        )
+
+        let lines = withoutMarkers
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+            .components(separatedBy: .newlines)
+            .map { collapseSpaces(in: $0).trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        let collapsed = lines.joined(separator: "\n")
+        let cleaned = Self.spaceBeforePunctuationRegex.stringByReplacingMatches(
+            in: collapsed,
+            range: NSRange(collapsed.startIndex..., in: collapsed),
+            withTemplate: "$1"
+        )
+        return (cleaned.trimmingCharacters(in: .whitespacesAndNewlines), true)
+    }
+
+    private func collapseSpaces(in text: String) -> String {
+        Self.repeatedSpacesRegex.stringByReplacingMatches(
+            in: text,
+            range: NSRange(text.startIndex..., in: text),
+            withTemplate: " "
+        )
     }
 }

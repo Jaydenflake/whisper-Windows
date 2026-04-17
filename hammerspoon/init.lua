@@ -109,11 +109,41 @@ local function normalizeTranscript(text)
     return nil
   end
 
-  if not trimmed:match("[%w]") then
+  local cleaned = trimmed
+  local placeholderPatterns = {
+    "%[%s*BLANK[_%- ]AUDIO%s*%]",
+    "%(%s*BLANK[_%- ]AUDIO%s*%)",
+    "%[%s*NO[_%- ]SPEECH%s*%]",
+    "%(%s*NO[_%- ]SPEECH%s*%)",
+    "%[%s*NOSPEECH%s*%]",
+    "%(%s*NOSPEECH%s*%)",
+    "%[%s*SILENCE%s*%]",
+    "%(%s*SILENCE%s*%)",
+  }
+
+  for _, pattern in ipairs(placeholderPatterns) do
+    cleaned = cleaned:gsub(pattern, " ")
+  end
+
+  local lines = {}
+  for line in cleaned:gsub("\r\n", "\n"):gsub("\r", "\n"):gmatch("[^\n]+") do
+    local normalizedLine = line
+      :gsub("[ \t][ \t]+", " ")
+      :gsub("^%s+", "")
+      :gsub("%s+$", "")
+      :gsub("%s+([,%.!%?;:])", "%1")
+
+    if normalizedLine ~= "" then
+      table.insert(lines, normalizedLine)
+    end
+  end
+
+  cleaned = table.concat(lines, "\n")
+  if cleaned == "" or not cleaned:match("[%w]") then
     return nil
   end
 
-  return trimmed
+  return cleaned
 end
 
 local function pasteTranscript(text)
@@ -205,6 +235,9 @@ local function pollForResults()
       pendingCount = math.max((response.pendingCount or pendingCount) - 1, 0)
       local result = response.result
       if result.text and result.text ~= "" then
+        if result.salvagePath and result.salvagePath ~= "" then
+          hs.printf("dictation salvage: %s", result.salvagePath)
+        end
         pasteTranscript(result.text)
       elseif result.errorMessage and result.errorMessage ~= "" then
         alert(result.errorMessage)
