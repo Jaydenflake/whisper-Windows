@@ -22,6 +22,12 @@ public struct SessionMetrics: Codable, Sendable {
     public let sessionId: String
     public let prebufferMilliseconds: Double
     public let audioDurationMilliseconds: Double
+    public let captureStartedAtISO8601: String?
+    public let captureStoppedAtISO8601: String?
+    public let captureWallClockMilliseconds: Double?
+    public let activeAudioMilliseconds: Double?
+    public let captureDroppedMilliseconds: Double?
+    public let captureCoverageRatio: Double?
     public let transcriptionMode: String?
     public let transcriptionMilliseconds: Double?
     public let queueWaitMilliseconds: Double?
@@ -31,6 +37,12 @@ public struct SessionMetrics: Codable, Sendable {
         sessionId: String,
         prebufferMilliseconds: Double,
         audioDurationMilliseconds: Double,
+        captureStartedAtISO8601: String? = nil,
+        captureStoppedAtISO8601: String? = nil,
+        captureWallClockMilliseconds: Double? = nil,
+        activeAudioMilliseconds: Double? = nil,
+        captureDroppedMilliseconds: Double? = nil,
+        captureCoverageRatio: Double? = nil,
         transcriptionMode: String?,
         transcriptionMilliseconds: Double?,
         queueWaitMilliseconds: Double?,
@@ -39,6 +51,12 @@ public struct SessionMetrics: Codable, Sendable {
         self.sessionId = sessionId
         self.prebufferMilliseconds = prebufferMilliseconds
         self.audioDurationMilliseconds = audioDurationMilliseconds
+        self.captureStartedAtISO8601 = captureStartedAtISO8601
+        self.captureStoppedAtISO8601 = captureStoppedAtISO8601
+        self.captureWallClockMilliseconds = captureWallClockMilliseconds
+        self.activeAudioMilliseconds = activeAudioMilliseconds
+        self.captureDroppedMilliseconds = captureDroppedMilliseconds
+        self.captureCoverageRatio = captureCoverageRatio
         self.transcriptionMode = transcriptionMode
         self.transcriptionMilliseconds = transcriptionMilliseconds
         self.queueWaitMilliseconds = queueWaitMilliseconds

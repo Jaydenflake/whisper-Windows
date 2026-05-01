@@ -37,6 +37,7 @@ private enum TranscriptionError: LocalizedError {
     case serverNoResponse
     case cliFailed(String)
     case lowConfidence(String)
+    case captureIncomplete(String)
     case combined(server: Error, cli: Error)
 
     var errorDescription: String? {
@@ -48,6 +49,8 @@ private enum TranscriptionError: LocalizedError {
         case .cliFailed(let details):
             return details
         case .lowConfidence(let details):
+            return details
+        case .captureIncomplete(let details):
             return details
         case .combined(let server, let cli):
             return "Server failed: \(server.localizedDescription). CLI fallback failed: \(cli.localizedDescription)"
@@ -154,11 +157,18 @@ final class TranscriptionManager: @unchecked Sendable {
     }
 
     private func transcribe(_ pending: PendingTranscription) -> SessionResultPayload {
-        let queueWaitMs = pending.enqueuedAt.timeIntervalSince(
-            pending.capture.startedAt.addingTimeInterval(Double(pending.capture.samples.count) / 16_000.0)
-        ) * 1000.0
+        let queueWaitMs = pending.enqueuedAt.timeIntervalSince(pending.capture.stoppedAt) * 1000.0
         let start = Date()
         let diskStatus = currentDiskStatus()
+        let integrityAssessment = captureIntegrityAssessment(for: pending.capture)
+
+        if integrityAssessment.requiresFailure {
+            return captureIncompleteResult(
+                for: pending,
+                assessment: integrityAssessment,
+                diskStatus: diskStatus
+            )
+        }
 
         if pending.capture.signalMetrics.probablySilent {
             return noSpeechResult(
@@ -423,11 +433,49 @@ final class TranscriptionManager: @unchecked Sendable {
         )
     }
 
+    private func captureIncompleteResult(
+        for pending: PendingTranscription,
+        assessment: CaptureIntegrityAssessment,
+        diskStatus: DiskSpaceStatus?
+    ) -> SessionResultPayload {
+        let diagnostic = TranscriptDiagnostic(
+            reason: assessment.reason ?? "capture-duration-gap",
+            rawTranscript: """
+            capture_wall_clock_ms: \(Int(assessment.captureWallClockMilliseconds))
+            captured_audio_ms: \(Int(assessment.capturedAudioMilliseconds))
+            prebuffer_ms: \(Int(assessment.prebufferMilliseconds))
+            active_audio_ms: \(Int(assessment.activeAudioMilliseconds))
+            dropped_ms: \(Int(assessment.droppedMilliseconds))
+            coverage_ratio: \(String(format: "%.2f", assessment.coverageRatio))
+            """,
+            cleanedTranscript: ""
+        )
+
+        return failedResult(
+            for: pending,
+            error: TranscriptionError.captureIncomplete("Audio capture dropped part of this dictation. Audio saved for review."),
+            diskStatus: diskStatus,
+            transcriptDiagnostic: diagnostic
+        )
+    }
+
     private func qualityAssessment(for capture: StoppedCapture, text: String) -> TranscriptQualityAssessment {
         TranscriptQuality.assess(
             text: text,
-            audioDurationMilliseconds: Double(capture.samples.count) / 16.0
+            audioDurationMilliseconds: audioDurationMilliseconds(for: capture)
         )
+    }
+
+    private func captureIntegrityAssessment(for capture: StoppedCapture) -> CaptureIntegrityAssessment {
+        CaptureIntegrity.assess(
+            capturedAudioMilliseconds: audioDurationMilliseconds(for: capture),
+            prebufferMilliseconds: capture.prebufferMilliseconds,
+            captureWallClockMilliseconds: capture.stoppedAt.timeIntervalSince(capture.startedAt) * 1000.0
+        )
+    }
+
+    private func audioDurationMilliseconds(for capture: StoppedCapture) -> Double {
+        Double(capture.samples.count) / 16.0
     }
 
     private func completedResult(
@@ -438,10 +486,17 @@ final class TranscriptionManager: @unchecked Sendable {
         start: Date,
         queueWaitMs: Double
     ) -> SessionResultPayload {
+        let integrity = captureIntegrityAssessment(for: capture)
         let metrics = SessionMetrics(
             sessionId: capture.sessionId,
             prebufferMilliseconds: capture.prebufferMilliseconds,
-            audioDurationMilliseconds: Double(capture.samples.count) / 16.0,
+            audioDurationMilliseconds: integrity.capturedAudioMilliseconds,
+            captureStartedAtISO8601: ISO8601DateFormatter().string(from: capture.startedAt),
+            captureStoppedAtISO8601: ISO8601DateFormatter().string(from: capture.stoppedAt),
+            captureWallClockMilliseconds: integrity.captureWallClockMilliseconds,
+            activeAudioMilliseconds: integrity.activeAudioMilliseconds,
+            captureDroppedMilliseconds: integrity.droppedMilliseconds,
+            captureCoverageRatio: integrity.coverageRatio,
             transcriptionMode: transcriptionMode,
             transcriptionMilliseconds: Date().timeIntervalSince(start) * 1000.0,
             queueWaitMilliseconds: max(queueWaitMs, 0),
@@ -463,10 +518,17 @@ final class TranscriptionManager: @unchecked Sendable {
         start: Date,
         queueWaitMs: Double
     ) -> SessionResultPayload {
+        let integrity = captureIntegrityAssessment(for: capture)
         let metrics = SessionMetrics(
             sessionId: capture.sessionId,
             prebufferMilliseconds: capture.prebufferMilliseconds,
-            audioDurationMilliseconds: Double(capture.samples.count) / 16.0,
+            audioDurationMilliseconds: integrity.capturedAudioMilliseconds,
+            captureStartedAtISO8601: ISO8601DateFormatter().string(from: capture.startedAt),
+            captureStoppedAtISO8601: ISO8601DateFormatter().string(from: capture.stoppedAt),
+            captureWallClockMilliseconds: integrity.captureWallClockMilliseconds,
+            activeAudioMilliseconds: integrity.activeAudioMilliseconds,
+            captureDroppedMilliseconds: integrity.droppedMilliseconds,
+            captureCoverageRatio: integrity.coverageRatio,
             transcriptionMode: transcriptionMode,
             transcriptionMilliseconds: Date().timeIntervalSince(start) * 1000.0,
             queueWaitMilliseconds: max(queueWaitMs, 0),
@@ -488,10 +550,17 @@ final class TranscriptionManager: @unchecked Sendable {
         diskStatus: DiskSpaceStatus?,
         transcriptDiagnostic: TranscriptDiagnostic? = nil
     ) -> SessionResultPayload {
+        let integrity = captureIntegrityAssessment(for: pending.capture)
         let metrics = SessionMetrics(
             sessionId: pending.capture.sessionId,
             prebufferMilliseconds: pending.capture.prebufferMilliseconds,
-            audioDurationMilliseconds: Double(pending.capture.samples.count) / 16.0,
+            audioDurationMilliseconds: integrity.capturedAudioMilliseconds,
+            captureStartedAtISO8601: ISO8601DateFormatter().string(from: pending.capture.startedAt),
+            captureStoppedAtISO8601: ISO8601DateFormatter().string(from: pending.capture.stoppedAt),
+            captureWallClockMilliseconds: integrity.captureWallClockMilliseconds,
+            activeAudioMilliseconds: integrity.activeAudioMilliseconds,
+            captureDroppedMilliseconds: integrity.droppedMilliseconds,
+            captureCoverageRatio: integrity.coverageRatio,
             transcriptionMode: "failed",
             transcriptionMilliseconds: nil,
             queueWaitMilliseconds: nil,
@@ -858,17 +927,35 @@ final class TranscriptionManager: @unchecked Sendable {
             try pending.wavData.write(to: wavURL, options: .atomic)
 
             let qualityReason: Any = assessment.reason ?? NSNull()
+            let integrity = captureIntegrityAssessment(for: pending.capture)
+            let integrityReason: Any = integrity.reason ?? NSNull()
             let payload: [String: Any] = [
                 "sessionId": pending.capture.sessionId,
                 "completedAtISO8601": ISO8601DateFormatter().string(from: Date()),
                 "transcriptionMode": transcriptionMode,
                 "text": transcript,
                 "metrics": [
-                    "audioDurationMilliseconds": Double(pending.capture.samples.count) / 16.0,
+                    "captureStartedAtISO8601": ISO8601DateFormatter().string(from: pending.capture.startedAt),
+                    "captureStoppedAtISO8601": ISO8601DateFormatter().string(from: pending.capture.stoppedAt),
+                    "audioDurationMilliseconds": integrity.capturedAudioMilliseconds,
                     "prebufferMilliseconds": pending.capture.prebufferMilliseconds,
+                    "captureWallClockMilliseconds": integrity.captureWallClockMilliseconds,
+                    "activeAudioMilliseconds": integrity.activeAudioMilliseconds,
+                    "captureDroppedMilliseconds": integrity.droppedMilliseconds,
+                    "captureCoverageRatio": integrity.coverageRatio,
                     "peakDecibels": jsonSafe(pending.capture.signalMetrics.peakDecibels),
                     "rmsDecibels": jsonSafe(pending.capture.signalMetrics.rmsDecibels),
                     "probablySilent": pending.capture.signalMetrics.probablySilent,
+                ],
+                "captureIntegrity": [
+                    "requiresFailure": integrity.requiresFailure,
+                    "reason": integrityReason,
+                    "capturedAudioMilliseconds": integrity.capturedAudioMilliseconds,
+                    "prebufferMilliseconds": integrity.prebufferMilliseconds,
+                    "captureWallClockMilliseconds": integrity.captureWallClockMilliseconds,
+                    "activeAudioMilliseconds": integrity.activeAudioMilliseconds,
+                    "droppedMilliseconds": integrity.droppedMilliseconds,
+                    "coverageRatio": integrity.coverageRatio,
                 ],
                 "quality": [
                     "requiresSecondPass": assessment.requiresSecondPass,
@@ -930,7 +1017,7 @@ final class TranscriptionManager: @unchecked Sendable {
             return false
         }
 
-        let audioDurationMilliseconds = Double(capture.samples.count) / 16.0
+        let audioDurationMilliseconds = audioDurationMilliseconds(for: capture)
         return audioDurationMilliseconds >= 1_500
     }
 
@@ -982,7 +1069,7 @@ final class TranscriptionManager: @unchecked Sendable {
             return false
         }
 
-        return (Double(capture.samples.count) / 16.0) >= Self.vadActivationDurationMilliseconds
+        return audioDurationMilliseconds(for: capture) >= Self.vadActivationDurationMilliseconds
     }
 
     private func isStandalonePlaceholderMarker(_ text: String) -> Bool {

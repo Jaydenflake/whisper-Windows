@@ -89,7 +89,7 @@ func ensureDaemonIfNeeded(for command: ControlCommand, config: AppConfig) throws
     let coldStartStart = DispatchTime.now().uptimeNanoseconds
     try launchDaemon(config: config)
 
-    let deadline = Date().addingTimeInterval(5.0)
+    let deadline = Date().addingTimeInterval(15.0)
     while Date() < deadline {
         if daemonIsReachable(config: config) {
             let coldStartEnd = DispatchTime.now().uptimeNanoseconds

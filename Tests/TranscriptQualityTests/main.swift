@@ -57,8 +57,44 @@ private func testReportedLongTaskFailureNeedsSecondPass() {
     expect(assessment.reason == "long-audio-short-transcript", "reported failure should have the expected reason")
 }
 
+private func testCaptureWithLargeDurationGapIsRejected() {
+    let assessment = CaptureIntegrity.assess(
+        capturedAudioMilliseconds: 21_300,
+        prebufferMilliseconds: 1_000,
+        captureWallClockMilliseconds: 60_000
+    )
+
+    expect(assessment.requiresFailure, "large capture duration gap should fail instead of pasting a partial transcript")
+    expect(assessment.reason == "capture-duration-gap", "expected capture-duration-gap reason")
+}
+
+private func testCaptureWithFullCoverageIsAccepted() {
+    let assessment = CaptureIntegrity.assess(
+        capturedAudioMilliseconds: 61_000,
+        prebufferMilliseconds: 1_000,
+        captureWallClockMilliseconds: 60_000
+    )
+
+    expect(!assessment.requiresFailure, "full capture coverage should be accepted")
+    expect(assessment.reason == nil, "full capture coverage should not have a reason")
+}
+
+private func testShortCaptureDurationGapIsNotOverPoliced() {
+    let assessment = CaptureIntegrity.assess(
+        capturedAudioMilliseconds: 2_600,
+        prebufferMilliseconds: 1_000,
+        captureWallClockMilliseconds: 3_000
+    )
+
+    expect(!assessment.requiresFailure, "short captures should not be failed by small timing gaps")
+    expect(assessment.reason == nil, "short captures should not have a reason")
+}
+
 testLongAudioWithTinyTranscriptNeedsSecondPass()
 testLongAudioWithExpectedWordVolumeDoesNotNeedSecondPass()
 testShortAudioWithShortTranscriptDoesNotNeedSecondPass()
 testReportedLongTaskFailureNeedsSecondPass()
+testCaptureWithLargeDurationGapIsRejected()
+testCaptureWithFullCoverageIsAccepted()
+testShortCaptureDurationGapIsNotOverPoliced()
 print("TranscriptQualityTests passed")

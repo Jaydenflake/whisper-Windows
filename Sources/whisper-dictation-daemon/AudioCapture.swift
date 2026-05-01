@@ -5,6 +5,7 @@ import WhisperDictationCore
 struct StoppedCapture {
     let sessionId: String
     let startedAt: Date
+    let stoppedAt: Date
     let prebufferMilliseconds: Double
     let samples: [Int16]
     let signalMetrics: AudioSignalMetrics
@@ -68,6 +69,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
         interleaved: true
     )!
     private var converter: AVAudioConverter?
+    private var converterInputFormat: AVAudioFormat?
     private let sessionLock = NSLock()
     private let converterLock = NSLock()
     private let lifecycleQueue = DispatchQueue(label: "whisper.dictation.capture.lifecycle")
@@ -76,6 +78,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
     private var startupSignaled = false
     private var configurationObserver: NSObjectProtocol?
     private var restartInFlight = false
+    private var deferredRestartReason: String?
 
     private(set) var engineStartupMilliseconds: Double?
     private(set) var defaultInputDeviceName: String?
@@ -130,11 +133,17 @@ final class AudioCaptureEngine: @unchecked Sendable {
             samples: prebufferSamples
         )
 
+        fputs(
+            "whisper-dictation-daemon: capture session started id=\(sessionId) prebuffer_ms=\(Int(prebufferMilliseconds))\n",
+            stderr
+        )
+
         return (sessionId: sessionId, prebufferMilliseconds: prebufferMilliseconds)
     }
 
     func stopSession(discard: Bool) throws -> StoppedCapture? {
         var capture: StoppedCapture?
+        let stoppedAt = Date()
 
         sessionLock.lock()
         defer { sessionLock.unlock() }
@@ -149,9 +158,19 @@ final class AudioCaptureEngine: @unchecked Sendable {
         }
 
         let signalMetrics = Self.analyze(samples: session.samples)
+        let audioDurationMilliseconds = Double(session.samples.count) / 16.0
+        let wallClockMilliseconds = stoppedAt.timeIntervalSince(session.startedAt) * 1000.0
+        let activeAudioMilliseconds = max(audioDurationMilliseconds - session.prebufferMilliseconds, 0)
+        let droppedMilliseconds = max(wallClockMilliseconds - activeAudioMilliseconds, 0)
+        fputs(
+            "whisper-dictation-daemon: capture session stopped id=\(session.sessionId) wall_ms=\(Int(wallClockMilliseconds)) audio_ms=\(Int(audioDurationMilliseconds)) prebuffer_ms=\(Int(session.prebufferMilliseconds)) dropped_ms=\(Int(droppedMilliseconds))\n",
+            stderr
+        )
+
         capture = StoppedCapture(
             sessionId: session.sessionId,
             startedAt: session.startedAt,
+            stoppedAt: stoppedAt,
             prebufferMilliseconds: session.prebufferMilliseconds,
             samples: session.samples,
             signalMetrics: signalMetrics
@@ -164,6 +183,8 @@ final class AudioCaptureEngine: @unchecked Sendable {
                 signalMetrics.rmsDecibels
             )
             scheduleRestart(reason: reason)
+        } else {
+            restartAfterSessionIfNeeded()
         }
 
         return capture
@@ -181,6 +202,11 @@ final class AudioCaptureEngine: @unchecked Sendable {
 
     private func handle(buffer: AVAudioPCMBuffer) {
         converterLock.lock()
+        if converter == nil || !Self.formatsMatch(converterInputFormat, buffer.format) {
+            converter = AVAudioConverter(from: buffer.format, to: outputFormat)
+            converterInputFormat = buffer.format
+        }
+
         guard let converter else {
             converterLock.unlock()
             return
@@ -246,14 +272,11 @@ final class AudioCaptureEngine: @unchecked Sendable {
         stopEngineLocked()
 
         let inputNode = engine.inputNode
-        let inputFormat = inputNode.inputFormat(forBus: 0)
-        guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-            throw AudioCaptureError.converterInitializationFailed
-        }
 
         let startupSemaphore = DispatchSemaphore(value: 0)
         converterLock.lock()
-        self.converter = converter
+        self.converter = nil
+        self.converterInputFormat = nil
         self.startupSemaphore = startupSemaphore
         self.startupSignaled = false
         converterLock.unlock()
@@ -262,7 +285,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
         inputNode.installTap(
             onBus: 0,
             bufferSize: AVAudioFrameCount(config.audioBufferSizeFrames),
-            format: inputFormat
+            format: nil
         ) { [weak self] buffer, _ in
             self?.handle(buffer: buffer)
         }
@@ -290,6 +313,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
 
         converterLock.lock()
         converter = nil
+        converterInputFormat = nil
         startupSemaphore = DispatchSemaphore(value: 0)
         startupSignaled = false
         converterLock.unlock()
@@ -298,18 +322,46 @@ final class AudioCaptureEngine: @unchecked Sendable {
     private func scheduleRestart(reason: String) {
         lifecycleQueue.async { [weak self] in
             guard let self else { return }
-            guard !self.restartInFlight else { return }
-            self.restartInFlight = true
-            defer { self.restartInFlight = false }
-
-            fputs("whisper-dictation-daemon: restarting audio capture (\(reason))\n", stderr)
-
-            do {
-                try self.startEngineLocked()
-            } catch {
-                fputs("whisper-dictation-daemon: audio capture restart failed: \(error.localizedDescription)\n", stderr)
+            if self.sessionIsActive() {
+                self.deferredRestartReason = reason
+                fputs(
+                    "whisper-dictation-daemon: deferring audio capture restart until session stops (\(reason))\n",
+                    stderr
+                )
+                return
             }
+
+            self.restartNowLocked(reason: reason)
         }
+    }
+
+    private func restartAfterSessionIfNeeded() {
+        lifecycleQueue.async { [weak self] in
+            guard let self, let reason = self.deferredRestartReason else { return }
+            self.deferredRestartReason = nil
+            self.restartNowLocked(reason: "deferred: \(reason)")
+        }
+    }
+
+    private func restartNowLocked(reason: String) {
+        guard !restartInFlight else { return }
+        deferredRestartReason = nil
+        restartInFlight = true
+        defer { restartInFlight = false }
+
+        fputs("whisper-dictation-daemon: restarting audio capture (\(reason))\n", stderr)
+
+        do {
+            try startEngineLocked()
+        } catch {
+            fputs("whisper-dictation-daemon: audio capture restart failed: \(error.localizedDescription)\n", stderr)
+        }
+    }
+
+    private func sessionIsActive() -> Bool {
+        sessionLock.lock()
+        defer { sessionLock.unlock() }
+        return activeSession != nil
     }
 
     private static func analyze(samples: [Int16]) -> AudioSignalMetrics {
@@ -347,5 +399,16 @@ final class AudioCaptureEngine: @unchecked Sendable {
         }
 
         return 20.0 * log10(normalizedMagnitude)
+    }
+
+    private static func formatsMatch(_ lhs: AVAudioFormat?, _ rhs: AVAudioFormat) -> Bool {
+        guard let lhs else {
+            return false
+        }
+
+        return lhs.sampleRate == rhs.sampleRate
+            && lhs.channelCount == rhs.channelCount
+            && lhs.commonFormat == rhs.commonFormat
+            && lhs.isInterleaved == rhs.isInterleaved
     }
 }
