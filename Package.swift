@@ -27,5 +27,10 @@ let package = Package(
             name: "whisper-dictation-ctl",
             dependencies: ["WhisperDictationCore"]
         ),
+        .executableTarget(
+            name: "transcript-quality-tests",
+            dependencies: ["WhisperDictationCore"],
+            path: "Tests/TranscriptQualityTests"
+        ),
     ]
 )

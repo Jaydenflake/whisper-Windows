@@ -36,6 +36,7 @@ private enum TranscriptionError: LocalizedError {
     case serverHTTPError(Int)
     case serverNoResponse
     case cliFailed(String)
+    case lowConfidence(String)
     case combined(server: Error, cli: Error)
 
     var errorDescription: String? {
@@ -45,6 +46,8 @@ private enum TranscriptionError: LocalizedError {
         case .serverNoResponse:
             return "No response body from whisper-server"
         case .cliFailed(let details):
+            return details
+        case .lowConfidence(let details):
             return details
         case .combined(let server, let cli):
             return "Server failed: \(server.localizedDescription). CLI fallback failed: \(cli.localizedDescription)"
@@ -56,6 +59,7 @@ final class TranscriptionManager: @unchecked Sendable {
     private static let vadActivationDurationMilliseconds = 15_000.0
     private static let vadMinSilenceDurationMilliseconds = 350
     private static let vadSpeechPadMilliseconds = 80
+    private static let recentCaptureLimit = 12
     private static let inlinePlaceholderRegex = try! NSRegularExpression(
         pattern: #"[\[\(]\s*(?:BLANK[\s_-]*AUDIO|NO[\s_-]*SPEECH|NOSPEECH|SILENCE)\s*[\]\)]"#,
         options: [.caseInsensitive]
@@ -168,11 +172,24 @@ final class TranscriptionManager: @unchecked Sendable {
         do {
             switch try transcribeViaServerWithRecovery(pending) {
             case .text(let text, let diagnostic):
-                let salvagePath = diagnostic.flatMap { self.persistSalvage(for: pending, transcriptDiagnostic: $0) }
-                return completedResult(
-                    for: pending.capture,
+                let assessment = qualityAssessment(for: pending.capture, text: text)
+                if assessment.requiresSecondPass {
+                    return secondPassResult(
+                        for: pending,
+                        serverText: text,
+                        serverDiagnostic: diagnostic,
+                        serverAssessment: assessment,
+                        start: start,
+                        queueWaitMs: queueWaitMs,
+                        diskStatus: diskStatus
+                    )
+                }
+
+                return acceptedTextResult(
+                    for: pending,
                     text: text,
-                    salvagePath: salvagePath,
+                    diagnostic: diagnostic,
+                    assessment: assessment,
                     transcriptionMode: "server",
                     start: start,
                     queueWaitMs: queueWaitMs
@@ -190,11 +207,25 @@ final class TranscriptionManager: @unchecked Sendable {
                 do {
                     switch try transcribeViaCLI(pending) {
                     case .text(let text, let diagnostic):
-                        let salvagePath = diagnostic.flatMap { self.persistSalvage(for: pending, transcriptDiagnostic: $0) }
-                        return completedResult(
-                            for: pending.capture,
+                        let assessment = qualityAssessment(for: pending.capture, text: text)
+                        guard !assessment.requiresSecondPass else {
+                            return lowConfidenceResult(
+                                for: pending,
+                                reason: assessment.reason ?? "low-confidence-transcript",
+                                serverText: nil,
+                                fallbackText: text,
+                                assessment: assessment,
+                                start: start,
+                                queueWaitMs: queueWaitMs,
+                                diskStatus: diskStatus
+                            )
+                        }
+
+                        return acceptedTextResult(
+                            for: pending,
                             text: text,
-                            salvagePath: salvagePath,
+                            diagnostic: diagnostic,
+                            assessment: assessment,
                             transcriptionMode: "cli",
                             start: start,
                             queueWaitMs: queueWaitMs
@@ -224,11 +255,25 @@ final class TranscriptionManager: @unchecked Sendable {
             do {
                 switch try transcribeViaCLI(pending) {
                 case .text(let text, let diagnostic):
-                    let salvagePath = diagnostic.flatMap { self.persistSalvage(for: pending, transcriptDiagnostic: $0) }
-                    return completedResult(
-                        for: pending.capture,
+                    let assessment = qualityAssessment(for: pending.capture, text: text)
+                    guard !assessment.requiresSecondPass else {
+                        return lowConfidenceResult(
+                            for: pending,
+                            reason: assessment.reason ?? "low-confidence-transcript",
+                            serverText: nil,
+                            fallbackText: text,
+                            assessment: assessment,
+                            start: start,
+                            queueWaitMs: queueWaitMs,
+                            diskStatus: diskStatus
+                        )
+                    }
+
+                    return acceptedTextResult(
+                        for: pending,
                         text: text,
-                        salvagePath: salvagePath,
+                        diagnostic: diagnostic,
+                        assessment: assessment,
                         transcriptionMode: "cli",
                         start: start,
                         queueWaitMs: queueWaitMs
@@ -249,6 +294,140 @@ final class TranscriptionManager: @unchecked Sendable {
                 )
             }
         }
+    }
+
+    private func acceptedTextResult(
+        for pending: PendingTranscription,
+        text: String,
+        diagnostic: TranscriptDiagnostic?,
+        assessment: TranscriptQualityAssessment,
+        transcriptionMode: String,
+        start: Date,
+        queueWaitMs: Double
+    ) -> SessionResultPayload {
+        let salvagePath = diagnostic.flatMap { self.persistSalvage(for: pending, transcriptDiagnostic: $0) }
+        persistRecentCapture(
+            for: pending,
+            transcript: text,
+            transcriptionMode: transcriptionMode,
+            assessment: assessment
+        )
+
+        return completedResult(
+            for: pending.capture,
+            text: text,
+            salvagePath: salvagePath,
+            transcriptionMode: transcriptionMode,
+            start: start,
+            queueWaitMs: queueWaitMs
+        )
+    }
+
+    private func secondPassResult(
+        for pending: PendingTranscription,
+        serverText: String,
+        serverDiagnostic: TranscriptDiagnostic?,
+        serverAssessment: TranscriptQualityAssessment,
+        start: Date,
+        queueWaitMs: Double,
+        diskStatus: DiskSpaceStatus?
+    ) -> SessionResultPayload {
+        fputs(
+            "whisper-dictation-daemon: low-confidence server transcript; running CLI second pass (\(serverAssessment.reason ?? "unknown"))\n",
+            stderr
+        )
+
+        do {
+            switch try transcribeViaCLI(pending) {
+            case .text(let cliText, let cliDiagnostic):
+                let cliAssessment = qualityAssessment(for: pending.capture, text: cliText)
+                guard !cliAssessment.requiresSecondPass else {
+                    return lowConfidenceResult(
+                        for: pending,
+                        reason: cliAssessment.reason ?? serverAssessment.reason ?? "low-confidence-transcript",
+                        serverText: serverText,
+                        fallbackText: cliText,
+                        assessment: cliAssessment,
+                        start: start,
+                        queueWaitMs: queueWaitMs,
+                        diskStatus: diskStatus
+                    )
+                }
+
+                return acceptedTextResult(
+                    for: pending,
+                    text: cliText,
+                    diagnostic: cliDiagnostic ?? serverDiagnostic,
+                    assessment: cliAssessment,
+                    transcriptionMode: "cli-second-pass",
+                    start: start,
+                    queueWaitMs: queueWaitMs
+                )
+            case .noSpeech:
+                return lowConfidenceResult(
+                    for: pending,
+                    reason: serverAssessment.reason ?? "low-confidence-transcript",
+                    serverText: serverText,
+                    fallbackText: nil,
+                    assessment: serverAssessment,
+                    start: start,
+                    queueWaitMs: queueWaitMs,
+                    diskStatus: diskStatus
+                )
+            }
+        } catch {
+            return lowConfidenceResult(
+                for: pending,
+                reason: serverAssessment.reason ?? "low-confidence-transcript",
+                serverText: serverText,
+                fallbackText: "CLI second pass failed: \(error.localizedDescription)",
+                assessment: serverAssessment,
+                start: start,
+                queueWaitMs: queueWaitMs,
+                diskStatus: diskStatus
+            )
+        }
+    }
+
+    private func lowConfidenceResult(
+        for pending: PendingTranscription,
+        reason: String,
+        serverText: String?,
+        fallbackText: String?,
+        assessment: TranscriptQualityAssessment,
+        start: Date,
+        queueWaitMs: Double,
+        diskStatus: DiskSpaceStatus?
+    ) -> SessionResultPayload {
+        let diagnostic = TranscriptDiagnostic(
+            reason: reason,
+            rawTranscript: """
+            audio_duration_ms: \(Int(assessment.audioDurationMilliseconds))
+            words_per_second: \(String(format: "%.2f", assessment.wordsPerSecond))
+            characters_per_second: \(String(format: "%.2f", assessment.charactersPerSecond))
+
+            server transcript:
+            \(serverText ?? "(none)")
+
+            fallback transcript:
+            \(fallbackText ?? "(none)")
+            """,
+            cleanedTranscript: fallbackText ?? serverText ?? ""
+        )
+
+        return failedResult(
+            for: pending,
+            error: TranscriptionError.lowConfidence("Low-confidence dictation. Audio saved for review."),
+            diskStatus: diskStatus,
+            transcriptDiagnostic: diagnostic
+        )
+    }
+
+    private func qualityAssessment(for capture: StoppedCapture, text: String) -> TranscriptQualityAssessment {
+        TranscriptQuality.assess(
+            text: text,
+            audioDurationMilliseconds: Double(capture.samples.count) / 16.0
+        )
     }
 
     private func completedResult(
@@ -306,7 +485,8 @@ final class TranscriptionManager: @unchecked Sendable {
     private func failedResult(
         for pending: PendingTranscription,
         error: Error,
-        diskStatus: DiskSpaceStatus?
+        diskStatus: DiskSpaceStatus?,
+        transcriptDiagnostic: TranscriptDiagnostic? = nil
     ) -> SessionResultPayload {
         let metrics = SessionMetrics(
             sessionId: pending.capture.sessionId,
@@ -318,7 +498,7 @@ final class TranscriptionManager: @unchecked Sendable {
             completedAtISO8601: ISO8601DateFormatter().string(from: Date())
         )
 
-        let salvagePath = persistSalvage(for: pending)
+        let salvagePath = persistSalvage(for: pending, transcriptDiagnostic: transcriptDiagnostic)
         let errorMessage = userFacingErrorMessage(for: error, diskStatus: diskStatus)
         fputs(
             "whisper-dictation-daemon: transcription failed: \(errorMessage) [\(error.localizedDescription)]\n",
@@ -647,7 +827,7 @@ final class TranscriptionManager: @unchecked Sendable {
                 """
                 try contents.write(to: diagnosticsURL, atomically: true, encoding: .utf8)
                 fputs(
-                    "whisper-dictation-daemon: placeholder artifacts detected; saved diagnostics to \(diagnosticsURL.path)\n",
+                    "whisper-dictation-daemon: \(transcriptDiagnostic.reason); saved diagnostics to \(diagnosticsURL.path)\n",
                     stderr
                 )
             }
@@ -659,6 +839,86 @@ final class TranscriptionManager: @unchecked Sendable {
             )
             return nil
         }
+    }
+
+    private func persistRecentCapture(
+        for pending: PendingTranscription,
+        transcript: String,
+        transcriptionMode: String,
+        assessment: TranscriptQualityAssessment
+    ) {
+        let recentDirectory = paths.salvageDirectoryURL.appendingPathComponent("recent", isDirectory: true)
+        let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let baseName = "recent-\(stamp)-\(pending.capture.sessionId)"
+        let wavURL = recentDirectory.appendingPathComponent("\(baseName).wav")
+        let jsonURL = recentDirectory.appendingPathComponent("\(baseName).json")
+
+        do {
+            try FileManager.default.createDirectory(at: recentDirectory, withIntermediateDirectories: true)
+            try pending.wavData.write(to: wavURL, options: .atomic)
+
+            let qualityReason: Any = assessment.reason ?? NSNull()
+            let payload: [String: Any] = [
+                "sessionId": pending.capture.sessionId,
+                "completedAtISO8601": ISO8601DateFormatter().string(from: Date()),
+                "transcriptionMode": transcriptionMode,
+                "text": transcript,
+                "metrics": [
+                    "audioDurationMilliseconds": Double(pending.capture.samples.count) / 16.0,
+                    "prebufferMilliseconds": pending.capture.prebufferMilliseconds,
+                    "peakDecibels": jsonSafe(pending.capture.signalMetrics.peakDecibels),
+                    "rmsDecibels": jsonSafe(pending.capture.signalMetrics.rmsDecibels),
+                    "probablySilent": pending.capture.signalMetrics.probablySilent,
+                ],
+                "quality": [
+                    "requiresSecondPass": assessment.requiresSecondPass,
+                    "reason": qualityReason,
+                    "wordCount": assessment.wordCount,
+                    "characterCount": assessment.characterCount,
+                    "wordsPerSecond": assessment.wordsPerSecond,
+                    "charactersPerSecond": assessment.charactersPerSecond,
+                ],
+            ]
+            let jsonData = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try jsonData.write(to: jsonURL, options: .atomic)
+            cleanupRecentCaptures(in: recentDirectory)
+        } catch {
+            fputs(
+                "whisper-dictation-daemon: unable to save recent dictation proof: \(error.localizedDescription)\n",
+                stderr
+            )
+        }
+    }
+
+    private func cleanupRecentCaptures(in directory: URL) {
+        do {
+            let wavs = try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+            )
+            .filter { $0.pathExtension == "wav" }
+            .sorted { lhs, rhs in
+                let leftDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rightDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return leftDate > rightDate
+            }
+
+            for staleWAV in wavs.dropFirst(Self.recentCaptureLimit) {
+                let base = staleWAV.deletingPathExtension()
+                try? FileManager.default.removeItem(at: staleWAV)
+                try? FileManager.default.removeItem(at: base.appendingPathExtension("json"))
+            }
+        } catch {
+            fputs(
+                "whisper-dictation-daemon: unable to clean recent dictation proof: \(error.localizedDescription)\n",
+                stderr
+            )
+        }
+    }
+
+    private func jsonSafe(_ value: Double) -> Any {
+        value.isFinite ? value : NSNull()
     }
 
     private func currentDiskStatus() -> DiskSpaceStatus? {
