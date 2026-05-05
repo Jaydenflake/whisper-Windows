@@ -121,10 +121,12 @@ final class WhisperDictationDaemon: @unchecked Sendable {
 
     private func makeStatusPayload(recording: Bool) -> StatusPayload {
         let diskStatus = DiskSpaceMonitor.currentStatus(for: paths.tempDirectoryURL.path)
+        let captureReadiness = captureEngine.readinessAssessment()
         return StatusPayload(
             recording: recording,
             pendingCount: transcriptionManager.pendingCount(),
-            engineReady: true,
+            engineReady: captureReadiness.ready,
+            engineHealthMessage: captureHealthMessage(from: captureReadiness),
             engineStartupMilliseconds: captureEngine.engineStartupMilliseconds,
             prebufferAvailableMilliseconds: captureEngine.prebufferAvailableMilliseconds(),
             preferredInputDevice: config.preferredInputDevice,
@@ -174,5 +176,22 @@ final class WhisperDictationDaemon: @unchecked Sendable {
         }
 
         return "Disk Almost Full (\(diskStatus.summary) free)"
+    }
+
+    private func captureHealthMessage(from readiness: CaptureReadinessAssessment) -> String? {
+        guard !readiness.ready else {
+            return nil
+        }
+
+        switch readiness.reason {
+        case "capture-engine-stopped":
+            return "Audio Input Recovering"
+        case "capture-buffer-missing":
+            return "Audio Input Warming Up"
+        case "capture-buffer-stale":
+            return "Audio Input Stalled"
+        default:
+            return "Audio Input Not Ready"
+        }
     }
 }

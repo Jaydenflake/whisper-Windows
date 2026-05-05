@@ -90,6 +90,53 @@ private func testShortCaptureDurationGapIsNotOverPoliced() {
     expect(assessment.reason == nil, "short captures should not have a reason")
 }
 
+private func testPrebufferOnlyCaptureIsRejectedEvenWhenShort() {
+    let assessment = CaptureIntegrity.assess(
+        capturedAudioMilliseconds: 1_000,
+        prebufferMilliseconds: 1_000,
+        captureWallClockMilliseconds: 2_300
+    )
+
+    expect(assessment.requiresFailure, "prebuffer-only captures should fail instead of surfacing as no output")
+    expect(assessment.reason == "capture-stalled", "expected capture-stalled reason")
+}
+
+private func testCaptureReadinessRejectsStaleBuffers() {
+    let assessment = CaptureReadiness.assess(
+        engineRunning: true,
+        startupSignaled: true,
+        secondsSinceLastBuffer: 3.5
+    )
+
+    expect(!assessment.ready, "stale capture buffers should not be considered ready")
+    expect(assessment.reason == "capture-buffer-stale", "expected capture-buffer-stale reason")
+}
+
+private func testCaptureReadinessAcceptsFreshRunningEngine() {
+    let assessment = CaptureReadiness.assess(
+        engineRunning: true,
+        startupSignaled: true,
+        secondsSinceLastBuffer: 0.2
+    )
+
+    expect(assessment.ready, "fresh running capture engine should be ready")
+    expect(assessment.reason == nil, "ready capture engine should not have a reason")
+}
+
+private func testRestartPolicyEscalatesAfterRepeatedFailures() {
+    let decision = CaptureRestartPolicy.assess(consecutiveFailureCount: 3)
+
+    expect(decision.action == .restartProcess, "repeated capture restart failures should restart the process")
+    expect(decision.reason == "capture-restart-failed-repeatedly", "expected repeated-failure reason")
+}
+
+private func testRestartPolicyRetriesInitialFailures() {
+    let decision = CaptureRestartPolicy.assess(consecutiveFailureCount: 1)
+
+    expect(decision.action == .retry, "first capture restart failure should retry in-process")
+    expect(decision.reason == "capture-restart-failed", "expected simple retry reason")
+}
+
 testLongAudioWithTinyTranscriptNeedsSecondPass()
 testLongAudioWithExpectedWordVolumeDoesNotNeedSecondPass()
 testShortAudioWithShortTranscriptDoesNotNeedSecondPass()
@@ -97,4 +144,9 @@ testReportedLongTaskFailureNeedsSecondPass()
 testCaptureWithLargeDurationGapIsRejected()
 testCaptureWithFullCoverageIsAccepted()
 testShortCaptureDurationGapIsNotOverPoliced()
+testPrebufferOnlyCaptureIsRejectedEvenWhenShort()
+testCaptureReadinessRejectsStaleBuffers()
+testCaptureReadinessAcceptsFreshRunningEngine()
+testRestartPolicyEscalatesAfterRepeatedFailures()
+testRestartPolicyRetriesInitialFailures()
 print("TranscriptQualityTests passed")

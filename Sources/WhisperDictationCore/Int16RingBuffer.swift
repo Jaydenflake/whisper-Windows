@@ -38,6 +38,15 @@ public final class Int16RingBuffer: @unchecked Sendable {
         return Array(storage[writeIndex..<capacity] + storage[0..<writeIndex])
     }
 
+    public func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+
+        storage = Array(repeating: 0, count: capacity)
+        writeIndex = 0
+        count = 0
+    }
+
     public var availableMilliseconds: Double {
         lock.lock()
         defer { lock.unlock() }

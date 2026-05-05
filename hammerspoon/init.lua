@@ -159,7 +159,15 @@ local function pasteTranscript(text)
 end
 
 local function maybeWarnAboutStatus(status)
-  if not status or not status.lowDiskSpaceMessage then
+  if not status then
+    return
+  end
+
+  local message = status.lowDiskSpaceMessage
+  if not message and status.engineReady == false then
+    message = status.engineHealthMessage or "Audio Input Not Ready"
+  end
+  if not message then
     return
   end
 
@@ -169,7 +177,7 @@ local function maybeWarnAboutStatus(status)
   end
 
   lastHealthWarningAt = now
-  alert(status.lowDiskSpaceMessage)
+  alert(message)
 end
 
 local function runControl(command, callback)

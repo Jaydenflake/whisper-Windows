@@ -12,6 +12,8 @@ public struct CaptureIntegrityAssessment: Codable, Sendable {
 }
 
 public enum CaptureIntegrity {
+    private static let minimumStalledWallClockMilliseconds = 1_000.0
+    private static let maximumStalledActiveAudioMilliseconds = 250.0
     private static let minimumWallClockMilliseconds = 5_000.0
     private static let allowedDroppedMilliseconds = 2_000.0
     private static let minimumCoverageRatio = 0.80
@@ -26,9 +28,20 @@ public enum CaptureIntegrity {
         let dropped = max(wallClock - activeAudio, 0)
         let coverage = wallClock > 0 ? min(activeAudio / wallClock, 1) : 1
 
+        let captureStalled = wallClock >= minimumStalledWallClockMilliseconds
+            && activeAudio <= maximumStalledActiveAudioMilliseconds
+            && dropped > maximumStalledActiveAudioMilliseconds
         let hasLargeGap = wallClock >= minimumWallClockMilliseconds
             && dropped > allowedDroppedMilliseconds
             && coverage < minimumCoverageRatio
+        let reason: String?
+        if captureStalled {
+            reason = "capture-stalled"
+        } else if hasLargeGap {
+            reason = "capture-duration-gap"
+        } else {
+            reason = nil
+        }
 
         return CaptureIntegrityAssessment(
             capturedAudioMilliseconds: capturedAudioMilliseconds,
@@ -37,8 +50,8 @@ public enum CaptureIntegrity {
             activeAudioMilliseconds: activeAudio,
             droppedMilliseconds: dropped,
             coverageRatio: coverage,
-            requiresFailure: hasLargeGap,
-            reason: hasLargeGap ? "capture-duration-gap" : nil
+            requiresFailure: reason != nil,
+            reason: reason
         )
     }
 }

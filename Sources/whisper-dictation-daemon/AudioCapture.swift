@@ -1,4 +1,5 @@
 @preconcurrency import AVFoundation
+import Darwin
 import Foundation
 import WhisperDictationCore
 
@@ -19,6 +20,7 @@ struct AudioSignalMetrics: Sendable {
 
 enum AudioCaptureError: Error, LocalizedError {
     case startupTimedOut
+    case captureRecovering
     case converterInitializationFailed
     case alreadyRecording
     case noActiveSession
@@ -27,6 +29,8 @@ enum AudioCaptureError: Error, LocalizedError {
         switch self {
         case .startupTimedOut:
             return "Audio capture did not become ready in time."
+        case .captureRecovering:
+            return "Audio input is recovering. Try dictation again in a moment."
         case .converterInitializationFailed:
             return "Unable to initialize the audio converter."
         case .alreadyRecording:
@@ -58,10 +62,11 @@ private final class ConverterFeedState: @unchecked Sendable {
 final class AudioCaptureEngine: @unchecked Sendable {
     private static let silentPeakThresholdDecibels = -50.0
     private static let silentRMSThresholdDecibels = -55.0
+    private static let restartRetryDelaySeconds = 1.0
 
     private let config: AppConfig
     private let ringBuffer: Int16RingBuffer
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private let outputFormat = AVAudioFormat(
         commonFormat: .pcmFormatInt16,
         sampleRate: 16_000,
@@ -79,6 +84,9 @@ final class AudioCaptureEngine: @unchecked Sendable {
     private var configurationObserver: NSObjectProtocol?
     private var restartInFlight = false
     private var deferredRestartReason: String?
+    private var restartRetryWorkItem: DispatchWorkItem?
+    private var lastBufferAt: Date?
+    private var consecutiveRestartFailures = 0
 
     private(set) var engineStartupMilliseconds: Double?
     private(set) var defaultInputDeviceName: String?
@@ -87,13 +95,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
         self.config = config
         let ringCapacity = Int(Double(config.prebufferMilliseconds) * 16.0)
         self.ringBuffer = Int16RingBuffer(capacity: ringCapacity)
-        self.configurationObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: nil
-        ) { [weak self] _ in
-            self?.scheduleRestart(reason: "audio engine configuration changed")
-        }
+        installConfigurationObserver()
     }
 
     deinit {
@@ -115,6 +117,21 @@ final class AudioCaptureEngine: @unchecked Sendable {
     }
 
     func startSession() throws -> (sessionId: String, prebufferMilliseconds: Double) {
+        try lifecycleQueue.sync {
+            let readiness = captureReadinessLocked(now: Date())
+            guard !readiness.ready else {
+                return
+            }
+
+            fputs(
+                "whisper-dictation-daemon: capture not ready at session start (\(readiness.reason ?? "unknown")); restarting audio capture\n",
+                stderr
+            )
+            guard restartNowLocked(reason: "session-start-not-ready") else {
+                throw AudioCaptureError.captureRecovering
+            }
+        }
+
         sessionLock.lock()
         defer { sessionLock.unlock() }
 
@@ -200,6 +217,12 @@ final class AudioCaptureEngine: @unchecked Sendable {
         ringBuffer.availableMilliseconds
     }
 
+    func readinessAssessment() -> CaptureReadinessAssessment {
+        lifecycleQueue.sync {
+            captureReadinessLocked(now: Date())
+        }
+    }
+
     private func handle(buffer: AVAudioPCMBuffer) {
         converterLock.lock()
         if converter == nil || !Self.formatsMatch(converterInputFormat, buffer.format) {
@@ -252,7 +275,12 @@ final class AudioCaptureEngine: @unchecked Sendable {
         }
         sessionLock.unlock()
 
+        markBufferReceived()
+    }
+
+    private func markBufferReceived() {
         converterLock.lock()
+        lastBufferAt = Date()
         if !startupSignaled {
             startupSignaled = true
             let semaphore = startupSemaphore
@@ -269,7 +297,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
             enforceAsDefault: config.enforcePreferredInputDevice
         )
 
-        stopEngineLocked()
+        rebuildEngineLocked()
 
         let inputNode = engine.inputNode
 
@@ -304,19 +332,49 @@ final class AudioCaptureEngine: @unchecked Sendable {
 
         let endNs = DispatchTime.now().uptimeNanoseconds
         engineStartupMilliseconds = Double(endNs - startNs) / 1_000_000.0
+        restartRetryWorkItem?.cancel()
+        restartRetryWorkItem = nil
+        consecutiveRestartFailures = 0
     }
 
     private func stopEngineLocked() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
-        engine.reset()
+        stopCurrentEngineLocked()
 
         converterLock.lock()
         converter = nil
         converterInputFormat = nil
         startupSemaphore = DispatchSemaphore(value: 0)
         startupSignaled = false
+        lastBufferAt = nil
         converterLock.unlock()
+    }
+
+    private func rebuildEngineLocked() {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+            self.configurationObserver = nil
+        }
+
+        stopEngineLocked()
+        engine = AVAudioEngine()
+        installConfigurationObserver()
+    }
+
+    private func stopCurrentEngineLocked() {
+        engine.inputNode.removeTap(onBus: 0)
+        engine.stop()
+        engine.reset()
+        ringBuffer.clear()
+    }
+
+    private func installConfigurationObserver() {
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: nil
+        ) { [weak self] _ in
+            self?.scheduleRestart(reason: "audio engine configuration changed")
+        }
     }
 
     private func scheduleRestart(reason: String) {
@@ -331,7 +389,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
                 return
             }
 
-            self.restartNowLocked(reason: reason)
+            _ = self.restartNowLocked(reason: reason)
         }
     }
 
@@ -339,12 +397,13 @@ final class AudioCaptureEngine: @unchecked Sendable {
         lifecycleQueue.async { [weak self] in
             guard let self, let reason = self.deferredRestartReason else { return }
             self.deferredRestartReason = nil
-            self.restartNowLocked(reason: "deferred: \(reason)")
+            _ = self.restartNowLocked(reason: "deferred: \(reason)")
         }
     }
 
-    private func restartNowLocked(reason: String) {
-        guard !restartInFlight else { return }
+    @discardableResult
+    private func restartNowLocked(reason: String) -> Bool {
+        guard !restartInFlight else { return false }
         deferredRestartReason = nil
         restartInFlight = true
         defer { restartInFlight = false }
@@ -353,15 +412,67 @@ final class AudioCaptureEngine: @unchecked Sendable {
 
         do {
             try startEngineLocked()
+            return true
         } catch {
+            consecutiveRestartFailures += 1
             fputs("whisper-dictation-daemon: audio capture restart failed: \(error.localizedDescription)\n", stderr)
+            handleRestartFailureLocked()
+            return false
         }
+    }
+
+    private func handleRestartFailureLocked() {
+        let decision = CaptureRestartPolicy.assess(consecutiveFailureCount: consecutiveRestartFailures)
+        switch decision.action {
+        case .retry:
+            scheduleRestartRetryLocked(reason: decision.reason)
+        case .restartProcess:
+            fputs(
+                "whisper-dictation-daemon: audio capture restart failed \(consecutiveRestartFailures) times; exiting for launchd recovery\n",
+                stderr
+            )
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+                Darwin.exit(EX_TEMPFAIL)
+            }
+        }
+    }
+
+    private func scheduleRestartRetryLocked(reason: String) {
+        restartRetryWorkItem?.cancel()
+
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.sessionIsActive() {
+                self.deferredRestartReason = reason
+                return
+            }
+
+            _ = self.restartNowLocked(reason: reason)
+        }
+        restartRetryWorkItem = item
+        lifecycleQueue.asyncAfter(
+            deadline: .now() + Self.restartRetryDelaySeconds,
+            execute: item
+        )
     }
 
     private func sessionIsActive() -> Bool {
         sessionLock.lock()
         defer { sessionLock.unlock() }
         return activeSession != nil
+    }
+
+    private func captureReadinessLocked(now: Date) -> CaptureReadinessAssessment {
+        converterLock.lock()
+        let startupSignaled = self.startupSignaled
+        let secondsSinceLastBuffer = lastBufferAt.map { now.timeIntervalSince($0) }
+        converterLock.unlock()
+
+        return CaptureReadiness.assess(
+            engineRunning: engine.isRunning,
+            startupSignaled: startupSignaled,
+            secondsSinceLastBuffer: secondsSinceLastBuffer
+        )
     }
 
     private static func analyze(samples: [Int16]) -> AudioSignalMetrics {

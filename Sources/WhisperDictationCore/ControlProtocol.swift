@@ -90,6 +90,7 @@ public struct StatusPayload: Codable, Sendable {
     public let recording: Bool
     public let pendingCount: Int
     public let engineReady: Bool
+    public let engineHealthMessage: String?
     public let engineStartupMilliseconds: Double?
     public let prebufferAvailableMilliseconds: Double
     public let preferredInputDevice: String?
@@ -102,6 +103,7 @@ public struct StatusPayload: Codable, Sendable {
         recording: Bool,
         pendingCount: Int,
         engineReady: Bool,
+        engineHealthMessage: String? = nil,
         engineStartupMilliseconds: Double?,
         prebufferAvailableMilliseconds: Double,
         preferredInputDevice: String?,
@@ -113,6 +115,7 @@ public struct StatusPayload: Codable, Sendable {
         self.recording = recording
         self.pendingCount = pendingCount
         self.engineReady = engineReady
+        self.engineHealthMessage = engineHealthMessage
         self.engineStartupMilliseconds = engineStartupMilliseconds
         self.prebufferAvailableMilliseconds = prebufferAvailableMilliseconds
         self.preferredInputDevice = preferredInputDevice
