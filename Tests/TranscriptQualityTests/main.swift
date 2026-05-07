@@ -157,7 +157,7 @@ private func testRestartPolicyRetriesInitialFailures() {
     expect(decision.reason == "capture-restart-failed", "expected simple retry reason")
 }
 
-private func testSessionResultBufferCanReturnRequestedRecording() {
+private func testSessionResultBufferCanReturnRequestedRecordingWithoutDiscardingEarlierResults() {
     let buffer = SessionResultBuffer()
     buffer.append(makeResult(sessionId: "recording-a", text: "transcript A"))
     buffer.append(makeResult(sessionId: "recording-b", text: "transcript B"))
@@ -166,7 +166,12 @@ private func testSessionResultBufferCanReturnRequestedRecording() {
 
     expect(result?.sessionId == "recording-b", "requesting recording B should not return stale recording A")
     expect(result?.text == "transcript B", "requesting recording B should return transcript B")
-    expect(buffer.count() == 0, "stale older results should be discarded once the requested recording is delivered")
+    expect(buffer.count() == 1, "requesting recording B should not discard recording A")
+
+    let earlierResult = buffer.popNext()
+    expect(earlierResult?.sessionId == "recording-a", "recording A should remain available after recording B is delivered")
+    expect(earlierResult?.text == "transcript A", "recording A transcript should be preserved")
+    expect(buffer.count() == 0, "buffer should be empty after both recordings are consumed")
 }
 
 private func testSessionResultBufferPreservesResultsWhileRequestedRecordingIsPending() {
@@ -191,6 +196,6 @@ testCaptureReadinessRejectsStaleBuffers()
 testCaptureReadinessAcceptsFreshRunningEngine()
 testRestartPolicyEscalatesAfterRepeatedFailures()
 testRestartPolicyRetriesInitialFailures()
-testSessionResultBufferCanReturnRequestedRecording()
+testSessionResultBufferCanReturnRequestedRecordingWithoutDiscardingEarlierResults()
 testSessionResultBufferPreservesResultsWhileRequestedRecordingIsPending()
 print("TranscriptQualityTests passed")

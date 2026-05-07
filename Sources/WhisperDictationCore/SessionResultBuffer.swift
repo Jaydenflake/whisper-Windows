@@ -28,9 +28,7 @@ public final class SessionResultBuffer: @unchecked Sendable {
             return nil
         }
 
-        let result = results[index]
-        results.removeSubrange(...index)
-        return result
+        return results.remove(at: index)
     }
 
     public func count() -> Int {

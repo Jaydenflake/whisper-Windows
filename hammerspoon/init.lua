@@ -27,7 +27,7 @@ local recordState = "idle"
 local resultPoller = nil
 local recordingOverlay = nil
 local lastHealthWarningAt = 0
-local pendingSessionId = nil
+local pendingSessionIds = {}
 
 local function alert(message)
   hs.alert.show(message, 0.95)
@@ -239,12 +239,32 @@ local function stopResultPolling()
   end
 end
 
-local function pollForResults()
-  if recordState ~= "idle" then
+local function currentPendingSessionId()
+  return pendingSessionIds[1]
+end
+
+local function enqueuePendingSession(sessionId)
+  if sessionId and sessionId ~= "" then
+    table.insert(pendingSessionIds, sessionId)
+  end
+end
+
+local function removePendingSession(sessionId)
+  if not sessionId or sessionId == "" then
     return
   end
 
+  for index, pendingSessionId in ipairs(pendingSessionIds) do
+    if pendingSessionId == sessionId then
+      table.remove(pendingSessionIds, index)
+      return
+    end
+  end
+end
+
+local function pollForResults()
   local args = {}
+  local pendingSessionId = currentPendingSessionId()
   if pendingSessionId then
     table.insert(args, pendingSessionId)
   end
@@ -261,9 +281,7 @@ local function pollForResults()
 
     if response.resultAvailable and response.result then
       local result = response.result
-      if pendingSessionId and result.sessionId == pendingSessionId then
-        pendingSessionId = nil
-      end
+      removePendingSession(result.sessionId)
 
       if result.text and result.text ~= "" then
         if result.salvagePath and result.salvagePath ~= "" then
@@ -284,7 +302,7 @@ local function pollForResults()
       end
     end
 
-    if pendingCount <= 0 and recordState == "idle" then
+    if pendingCount <= 0 then
       stopResultPolling()
     end
   end)
@@ -375,12 +393,11 @@ local function stopRecording(discard)
 
     pendingCount = response.pendingCount or pendingCount
     if discard then
-      pendingSessionId = nil
       alert("Recording Canceled")
       return
     end
 
-    pendingSessionId = response.sessionId
+    enqueuePendingSession(response.sessionId)
     maybeWarnAboutStatus(response.status)
     ensureResultPolling()
     alert(string.format("Processing Audio (%d)", pendingCount))
