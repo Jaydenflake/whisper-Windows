@@ -12,9 +12,11 @@ public enum ControlCommand: String, Codable, Sendable {
 
 public struct ControlRequest: Codable, Sendable {
     public let command: ControlCommand
+    public let sessionId: String?
 
-    public init(command: ControlCommand) {
+    public init(command: ControlCommand, sessionId: String? = nil) {
         self.command = command
+        self.sessionId = sessionId
     }
 }
 

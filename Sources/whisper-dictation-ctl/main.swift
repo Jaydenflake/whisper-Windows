@@ -30,10 +30,11 @@ do {
     let commandName = args.first ?? "status"
     let config = try AppConfig.load()
     let command = try parseCommand(commandName)
+    let requestedSessionId = command == .nextResult ? args.dropFirst().first : nil
 
     let coldBootMilliseconds = try ensureDaemonIfNeeded(for: command, config: config)
     var response = try JSONSocketClient.send(
-        ControlRequest(command: command),
+        ControlRequest(command: command, sessionId: requestedSessionId),
         host: config.controlHost,
         port: config.controlPort
     )

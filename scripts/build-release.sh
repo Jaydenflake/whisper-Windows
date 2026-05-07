@@ -11,5 +11,7 @@ BIN_PATH="$(swift build -c release --show-bin-path)"
 mkdir -p "$ROOT/bin"
 cp "$BIN_PATH/whisper-dictation-daemon" "$ROOT/bin/whisper-dictation-daemon"
 cp "$BIN_PATH/whisper-dictation-ctl" "$ROOT/bin/whisper-dictation-ctl"
+codesign --force --sign - --identifier whisper-dictation-daemon "$ROOT/bin/whisper-dictation-daemon" >/dev/null
+codesign --force --sign - --identifier whisper-dictation-ctl "$ROOT/bin/whisper-dictation-ctl" >/dev/null
 
 echo "Release binaries copied to $ROOT/bin"

@@ -87,6 +87,9 @@ final class AudioCaptureEngine: @unchecked Sendable {
     private var restartRetryWorkItem: DispatchWorkItem?
     private var lastBufferAt: Date?
     private var consecutiveRestartFailures = 0
+    private var tapInstalled = false
+    private var engineRunningSnapshot = false
+    private var startupInProgress = false
 
     private(set) var engineStartupMilliseconds: Double?
     private(set) var defaultInputDeviceName: String?
@@ -110,6 +113,17 @@ final class AudioCaptureEngine: @unchecked Sendable {
         }
     }
 
+    func startAsync() {
+        lifecycleQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.startEngineLocked()
+            } catch {
+                fputs("whisper-dictation-daemon: audio capture start failed: \(error.localizedDescription)\n", stderr)
+            }
+        }
+    }
+
     func stop() {
         lifecycleQueue.sync {
             stopEngineLocked()
@@ -117,6 +131,11 @@ final class AudioCaptureEngine: @unchecked Sendable {
     }
 
     func startSession() throws -> (sessionId: String, prebufferMilliseconds: Double) {
+        guard readinessAssessment().ready else {
+            scheduleRestart(reason: "session-start-not-ready")
+            throw AudioCaptureError.captureRecovering
+        }
+
         try lifecycleQueue.sync {
             let readiness = captureReadinessLocked(now: Date())
             guard !readiness.ready else {
@@ -218,9 +237,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
     }
 
     func readinessAssessment() -> CaptureReadinessAssessment {
-        lifecycleQueue.sync {
-            captureReadinessLocked(now: Date())
-        }
+        captureReadinessLocked(now: Date())
     }
 
     private func handle(buffer: AVAudioPCMBuffer) {
@@ -292,12 +309,16 @@ final class AudioCaptureEngine: @unchecked Sendable {
     }
 
     private func startEngineLocked() throws {
+        setStartupInProgress(true)
+        defer { setStartupInProgress(false) }
+
         defaultInputDeviceName = try CoreAudioDevice.ensurePreferredInputDevice(
             named: config.preferredInputDevice,
             enforceAsDefault: config.enforcePreferredInputDevice
         )
 
         rebuildEngineLocked()
+        setStartupInProgress(true)
 
         let inputNode = engine.inputNode
 
@@ -317,6 +338,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
         ) { [weak self] buffer, _ in
             self?.handle(buffer: buffer)
         }
+        tapInstalled = true
 
         do {
             try engine.start()
@@ -324,6 +346,7 @@ final class AudioCaptureEngine: @unchecked Sendable {
             stopEngineLocked()
             throw error
         }
+        setEngineRunningSnapshot(true)
 
         guard startupSemaphore.wait(timeout: .now() + .seconds(2)) == .success else {
             stopEngineLocked()
@@ -346,6 +369,8 @@ final class AudioCaptureEngine: @unchecked Sendable {
         startupSemaphore = DispatchSemaphore(value: 0)
         startupSignaled = false
         lastBufferAt = nil
+        engineRunningSnapshot = false
+        startupInProgress = false
         converterLock.unlock()
     }
 
@@ -361,8 +386,14 @@ final class AudioCaptureEngine: @unchecked Sendable {
     }
 
     private func stopCurrentEngineLocked() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+        if tapInstalled {
+            engine.inputNode.removeTap(onBus: 0)
+            tapInstalled = false
+        }
+        if engine.isRunning {
+            engine.stop()
+        }
+        setEngineRunningSnapshot(false)
         engine.reset()
         ringBuffer.clear()
     }
@@ -464,15 +495,29 @@ final class AudioCaptureEngine: @unchecked Sendable {
 
     private func captureReadinessLocked(now: Date) -> CaptureReadinessAssessment {
         converterLock.lock()
+        let engineRunning = engineRunningSnapshot
+        let startupInProgress = startupInProgress
         let startupSignaled = self.startupSignaled
         let secondsSinceLastBuffer = lastBufferAt.map { now.timeIntervalSince($0) }
         converterLock.unlock()
 
         return CaptureReadiness.assess(
-            engineRunning: engine.isRunning,
-            startupSignaled: startupSignaled,
+            engineRunning: engineRunning || startupInProgress,
+            startupSignaled: startupSignaled && !startupInProgress,
             secondsSinceLastBuffer: secondsSinceLastBuffer
         )
+    }
+
+    private func setEngineRunningSnapshot(_ running: Bool) {
+        converterLock.lock()
+        engineRunningSnapshot = running
+        converterLock.unlock()
+    }
+
+    private func setStartupInProgress(_ inProgress: Bool) {
+        converterLock.lock()
+        startupInProgress = inProgress
+        converterLock.unlock()
     }
 
     private static func analyze(samples: [Int16]) -> AudioSignalMetrics {

@@ -5,9 +5,8 @@ final class WhisperDictationDaemon: @unchecked Sendable {
     private let config: AppConfig
     private let paths: AppPaths
     private let captureEngine: AudioCaptureEngine
-    private let completedLock = NSLock()
     private let shutdownLock = NSLock()
-    private var completedResults = [SessionResultPayload]()
+    private let completedResults = SessionResultBuffer()
     private var server: JSONSocketServer?
     private var signalSources = [DispatchSourceSignal]()
     private var shuttingDown = false
@@ -25,7 +24,7 @@ final class WhisperDictationDaemon: @unchecked Sendable {
     }
 
     func run() throws {
-        try captureEngine.start()
+        captureEngine.startAsync()
         transcriptionManager.prewarmServerIfNeeded()
 
         let server = JSONSocketServer(host: config.controlHost, port: config.controlPort) { [weak self] request in
@@ -51,7 +50,7 @@ final class WhisperDictationDaemon: @unchecked Sendable {
         case .cancel:
             return handleStop(discard: true)
         case .nextResult:
-            return handleNextResult()
+            return handleNextResult(sessionId: request.sessionId)
         case .status:
             return handleStatus()
         case .shutdown:
@@ -64,7 +63,7 @@ final class WhisperDictationDaemon: @unchecked Sendable {
             let started = try captureEngine.startSession()
             var response = ControlResponse(ok: true)
             response.recording = true
-            response.pendingCount = transcriptionManager.pendingCount()
+            response.pendingCount = outstandingResultCount()
             response.sessionId = started.sessionId
             response.status = makeStatusPayload(recording: true)
             return response
@@ -81,7 +80,7 @@ final class WhisperDictationDaemon: @unchecked Sendable {
             }
             var response = ControlResponse(ok: true)
             response.recording = false
-            response.pendingCount = transcriptionManager.pendingCount()
+            response.pendingCount = outstandingResultCount()
             response.sessionId = capture?.sessionId
             response.status = makeStatusPayload(recording: false)
             return response
@@ -90,15 +89,13 @@ final class WhisperDictationDaemon: @unchecked Sendable {
         }
     }
 
-    private func handleNextResult() -> ControlResponse {
-        completedLock.lock()
-        let result = completedResults.isEmpty ? nil : completedResults.removeFirst()
-        completedLock.unlock()
+    private func handleNextResult(sessionId: String?) -> ControlResponse {
+        let result = completedResults.popNext(sessionId: sessionId)
 
         var response = ControlResponse(ok: true)
         response.resultAvailable = (result != nil)
         response.result = result
-        response.pendingCount = transcriptionManager.pendingCount()
+        response.pendingCount = outstandingResultCount()
         response.recording = captureEngine.isRecording()
         return response
     }
@@ -106,7 +103,7 @@ final class WhisperDictationDaemon: @unchecked Sendable {
     private func handleStatus() -> ControlResponse {
         var response = ControlResponse(ok: true)
         response.recording = captureEngine.isRecording()
-        response.pendingCount = transcriptionManager.pendingCount()
+        response.pendingCount = outstandingResultCount()
         response.status = makeStatusPayload(recording: captureEngine.isRecording())
         return response
     }
@@ -124,7 +121,7 @@ final class WhisperDictationDaemon: @unchecked Sendable {
         let captureReadiness = captureEngine.readinessAssessment()
         return StatusPayload(
             recording: recording,
-            pendingCount: transcriptionManager.pendingCount(),
+            pendingCount: outstandingResultCount(),
             engineReady: captureReadiness.ready,
             engineHealthMessage: captureHealthMessage(from: captureReadiness),
             engineStartupMilliseconds: captureEngine.engineStartupMilliseconds,
@@ -138,9 +135,11 @@ final class WhisperDictationDaemon: @unchecked Sendable {
     }
 
     private func storeCompleted(_ result: SessionResultPayload) {
-        completedLock.lock()
         completedResults.append(result)
-        completedLock.unlock()
+    }
+
+    private func outstandingResultCount() -> Int {
+        transcriptionManager.pendingCount() + completedResults.count()
     }
 
     private func installSignalHandlers() {

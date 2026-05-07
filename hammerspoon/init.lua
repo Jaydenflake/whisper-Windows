@@ -27,6 +27,7 @@ local recordState = "idle"
 local resultPoller = nil
 local recordingOverlay = nil
 local lastHealthWarningAt = 0
+local pendingSessionId = nil
 
 local function alert(message)
   hs.alert.show(message, 0.95)
@@ -180,10 +181,20 @@ local function maybeWarnAboutStatus(status)
   alert(message)
 end
 
-local function runControl(command, callback)
+local function runControl(command, args, callback)
+  if type(args) == "function" then
+    callback = args
+    args = {}
+  end
+
   if not controlBin or not hs.fs.attributes(controlBin) then
     callback(nil, "Control binary not installed")
     return
+  end
+
+  local taskArgs = {command}
+  for _, arg in ipairs(args or {}) do
+    table.insert(taskArgs, arg)
   end
 
   local task = nil
@@ -210,7 +221,7 @@ local function runControl(command, callback)
     end
 
     callback(response, nil)
-  end, {command})
+  end, taskArgs)
 
   if not task then
     callback(nil, "Failed to launch control binary")
@@ -229,7 +240,16 @@ local function stopResultPolling()
 end
 
 local function pollForResults()
-  runControl("next-result", function(response, err)
+  if recordState ~= "idle" then
+    return
+  end
+
+  local args = {}
+  if pendingSessionId then
+    table.insert(args, pendingSessionId)
+  end
+
+  runControl("next-result", args, function(response, err)
     if err or not response then
       if err then
         hs.printf("dictation poll error: %s", err)
@@ -240,8 +260,11 @@ local function pollForResults()
     pendingCount = response.pendingCount or pendingCount
 
     if response.resultAvailable and response.result then
-      pendingCount = math.max((response.pendingCount or pendingCount) - 1, 0)
       local result = response.result
+      if pendingSessionId and result.sessionId == pendingSessionId then
+        pendingSessionId = nil
+      end
+
       if result.text and result.text ~= "" then
         if result.salvagePath and result.salvagePath ~= "" then
           hs.printf("dictation salvage: %s", result.salvagePath)
@@ -352,10 +375,12 @@ local function stopRecording(discard)
 
     pendingCount = response.pendingCount or pendingCount
     if discard then
+      pendingSessionId = nil
       alert("Recording Canceled")
       return
     end
 
+    pendingSessionId = response.sessionId
     maybeWarnAboutStatus(response.status)
     ensureResultPolling()
     alert(string.format("Processing Audio (%d)", pendingCount))

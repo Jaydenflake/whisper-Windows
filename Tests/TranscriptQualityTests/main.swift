@@ -8,6 +8,26 @@ private func expect(_ condition: @autoclosure () -> Bool, _ message: String) {
     }
 }
 
+private func makeResult(sessionId: String, text: String) -> SessionResultPayload {
+    let metrics = SessionMetrics(
+        sessionId: sessionId,
+        prebufferMilliseconds: 0,
+        audioDurationMilliseconds: 100,
+        transcriptionMode: "test",
+        transcriptionMilliseconds: 1,
+        queueWaitMilliseconds: 0,
+        completedAtISO8601: nil
+    )
+
+    return SessionResultPayload(
+        sessionId: sessionId,
+        text: text,
+        metrics: metrics,
+        salvagePath: nil,
+        errorMessage: nil
+    )
+}
+
 private func testLongAudioWithTinyTranscriptNeedsSecondPass() {
     let assessment = TranscriptQuality.assess(
         text: "Okay. Go ahead.",
@@ -137,6 +157,28 @@ private func testRestartPolicyRetriesInitialFailures() {
     expect(decision.reason == "capture-restart-failed", "expected simple retry reason")
 }
 
+private func testSessionResultBufferCanReturnRequestedRecording() {
+    let buffer = SessionResultBuffer()
+    buffer.append(makeResult(sessionId: "recording-a", text: "transcript A"))
+    buffer.append(makeResult(sessionId: "recording-b", text: "transcript B"))
+
+    let result = buffer.popNext(sessionId: "recording-b")
+
+    expect(result?.sessionId == "recording-b", "requesting recording B should not return stale recording A")
+    expect(result?.text == "transcript B", "requesting recording B should return transcript B")
+    expect(buffer.count() == 0, "stale older results should be discarded once the requested recording is delivered")
+}
+
+private func testSessionResultBufferPreservesResultsWhileRequestedRecordingIsPending() {
+    let buffer = SessionResultBuffer()
+    buffer.append(makeResult(sessionId: "recording-a", text: "transcript A"))
+
+    let result = buffer.popNext(sessionId: "recording-b")
+
+    expect(result == nil, "missing requested recording should not return an unrelated result")
+    expect(buffer.count() == 1, "unrelated results should stay buffered until the requested recording arrives")
+}
+
 testLongAudioWithTinyTranscriptNeedsSecondPass()
 testLongAudioWithExpectedWordVolumeDoesNotNeedSecondPass()
 testShortAudioWithShortTranscriptDoesNotNeedSecondPass()
@@ -149,4 +191,6 @@ testCaptureReadinessRejectsStaleBuffers()
 testCaptureReadinessAcceptsFreshRunningEngine()
 testRestartPolicyEscalatesAfterRepeatedFailures()
 testRestartPolicyRetriesInitialFailures()
+testSessionResultBufferCanReturnRequestedRecording()
+testSessionResultBufferPreservesResultsWhileRequestedRecordingIsPending()
 print("TranscriptQualityTests passed")
