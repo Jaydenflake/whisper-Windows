@@ -184,6 +184,57 @@ private func testSessionResultBufferPreservesResultsWhileRequestedRecordingIsPen
     expect(buffer.count() == 1, "unrelated results should stay buffered until the requested recording arrives")
 }
 
+private func legacyConfigJSON(controlHost: String = "127.0.0.1") -> Data {
+    """
+    {
+      "controlHost": "\(controlHost)",
+      "controlPort": 44123,
+      "preferredInputDevice": null,
+      "enforcePreferredInputDevice": false,
+      "prebufferMilliseconds": 1000,
+      "audioBufferSizeFrames": 128,
+      "pollIntervalMilliseconds": 150,
+      "whisperServerBinary": "/tmp/whisper-server",
+      "whisperCliBinary": "/tmp/whisper-cli",
+      "whisperModelPath": "/tmp/model.bin",
+      "whisperVADModelPath": null,
+      "whisperServerHost": "127.0.0.1",
+      "whisperServerPort": 8177,
+      "tempDirectory": "/tmp/WhisperDictation",
+      "salvageDirectory": "/tmp/WhisperSalvage",
+      "daemonLogPath": "/tmp/daemon.log",
+      "whisperServerLogPath": "/tmp/whisper-server.log",
+      "controlBinaryPath": "/tmp/whisper-dictation-ctl",
+      "daemonBinaryPath": "/tmp/whisper-dictation-daemon",
+      "warmServerOnLaunch": true,
+      "whisperThreads": 4
+    }
+    """.data(using: .utf8)!
+}
+
+private func testAppConfigDefaultsPublicBetaFieldsForLegacyConfig() {
+    let config = try! JSONDecoder().decode(AppConfig.self, from: legacyConfigJSON())
+
+    expect(!config.persistRecentCaptures, "recent capture persistence should default off for legacy configs")
+    expect(
+        config.serverRequestTimeoutSeconds == AppConfig.defaultServerRequestTimeoutSeconds,
+        "server timeout should default for legacy configs"
+    )
+    expect(
+        config.cliTimeoutSeconds == AppConfig.defaultCLITimeoutSeconds,
+        "CLI timeout should default for legacy configs"
+    )
+}
+
+private func testAppConfigRejectsNonLoopbackControlHost() {
+    do {
+        _ = try JSONDecoder().decode(AppConfig.self, from: legacyConfigJSON(controlHost: "0.0.0.0"))
+        expect(false, "non-loopback control hosts should be rejected")
+    } catch {
+        expect(true, "non-loopback control host rejected")
+    }
+}
+
 testLongAudioWithTinyTranscriptNeedsSecondPass()
 testLongAudioWithExpectedWordVolumeDoesNotNeedSecondPass()
 testShortAudioWithShortTranscriptDoesNotNeedSecondPass()
@@ -198,4 +249,6 @@ testRestartPolicyEscalatesAfterRepeatedFailures()
 testRestartPolicyRetriesInitialFailures()
 testSessionResultBufferCanReturnRequestedRecordingWithoutDiscardingEarlierResults()
 testSessionResultBufferPreservesResultsWhileRequestedRecordingIsPending()
+testAppConfigDefaultsPublicBetaFieldsForLegacyConfig()
+testAppConfigRejectsNonLoopbackControlHost()
 print("TranscriptQualityTests passed")

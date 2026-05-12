@@ -2,13 +2,18 @@
 
 set -euo pipefail
 
-ROOT="/Users/gabrielhansen/MyProjects/whisper.cpp"
-FFMPEG="/opt/homebrew/bin/ffmpeg"
-WHISPER_CLI="$ROOT/build/bin/whisper-cli"
-WHISPER_SERVER="$ROOT/build/bin/whisper-server"
-MODEL="$ROOT/models/ggml-small.en.bin"
+ROOT="${WHISPER_CPP_ROOT:-$HOME/MyProjects/whisper.cpp}"
+FFMPEG="${FFMPEG:-$(command -v ffmpeg || true)}"
+WHISPER_CLI="${WHISPER_CLI_BINARY:-$ROOT/build/bin/whisper-cli}"
+WHISPER_SERVER="${WHISPER_SERVER_BINARY:-$ROOT/build/bin/whisper-server}"
+MODEL="${WHISPER_MODEL_PATH:-$ROOT/models/ggml-small.en.bin}"
 PORT="${PORT:-8177}"
 OUT_DIR="${1:-$(pwd)/benchmark-output}"
+
+[[ -x "$FFMPEG" ]] || { echo "ffmpeg not found. Set FFMPEG=/absolute/path/to/ffmpeg." >&2; exit 1; }
+[[ -x "$WHISPER_CLI" ]] || { echo "whisper-cli not found. Set WHISPER_CPP_ROOT or WHISPER_CLI_BINARY." >&2; exit 1; }
+[[ -x "$WHISPER_SERVER" ]] || { echo "whisper-server not found. Set WHISPER_CPP_ROOT or WHISPER_SERVER_BINARY." >&2; exit 1; }
+[[ -f "$MODEL" ]] || { echo "model not found. Set WHISPER_MODEL_PATH." >&2; exit 1; }
 
 mkdir -p "$OUT_DIR"
 

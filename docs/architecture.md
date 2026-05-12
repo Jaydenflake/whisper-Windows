@@ -88,7 +88,7 @@ That removes:
 - builds the binaries
 - writes the config file
 - installs the LaunchAgent
-- installs the Hammerspoon config
+- installs the Hammerspoon dictation module with a guarded loader
 - warms the daemon
 
 ### Login Time
@@ -100,3 +100,5 @@ That removes:
 - start: open a logical session and keep buffering
 - stop: flush buffered audio, enqueue transcription, paste when complete
 - cancel: discard the active session without transcription
+
+Successful dictations are not retained by default. Failed or low-confidence sessions can write salvage artifacts for debugging, and successful recent capture retention is opt-in through config.

@@ -12,7 +12,9 @@ LOG_DIR="${LOG_DIR:-$HOME_DIR/Library/Logs/WhisperDictation}"
 SALVAGE_DIR="${SALVAGE_DIR:-$HOME_DIR/Documents/WhisperSalvage}"
 CONFIG_PATH="$APP_SUPPORT_DIR/config.json"
 HSM_TARGET="$HOME_DIR/.hammerspoon/init.lua"
+HSM_INCLUDE_TARGET="$HOME_DIR/.hammerspoon/whisper-dictation.lua"
 HSM_BACKUP="$HOME_DIR/.hammerspoon/init.lua.backup-$(date +%Y%m%d-%H%M%S)"
+HSM_INSTALL_MODE="${HAMMERSPOON_INSTALL_MODE:-include}"
 LAUNCH_AGENTS_DIR="$HOME_DIR/Library/LaunchAgents"
 LAUNCH_AGENT_LABEL="com.hansenhomeai.whisper-dictation"
 LAUNCH_AGENT_PATH="$LAUNCH_AGENTS_DIR/$LAUNCH_AGENT_LABEL.plist"
@@ -31,6 +33,9 @@ WARM_SERVER_ON_LAUNCH="${WARM_SERVER_ON_LAUNCH:-true}"
 WHISPER_THREADS="${WHISPER_THREADS:-4}"
 PREFERRED_INPUT_DEVICE="${PREFERRED_INPUT_DEVICE:-}"
 ENFORCE_PREFERRED_INPUT_DEVICE="${ENFORCE_PREFERRED_INPUT_DEVICE:-false}"
+PERSIST_RECENT_CAPTURES="${PERSIST_RECENT_CAPTURES:-false}"
+SERVER_REQUEST_TIMEOUT_SECONDS="${SERVER_REQUEST_TIMEOUT_SECONDS:-30}"
+CLI_TIMEOUT_SECONDS="${CLI_TIMEOUT_SECONDS:-90}"
 
 fail() {
   echo "install-local.sh: $*" >&2
@@ -39,6 +44,15 @@ fail() {
 
 lower() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+canonical_path() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(sys.argv[1]))
+PY
 }
 
 resolve_whisper_cpp_root() {
@@ -101,6 +115,110 @@ assert_bool() {
   esac
 }
 
+assert_positive_number() {
+  local name="$1"
+  local value="$2"
+  python3 - "$name" "$value" <<'PY'
+import sys
+
+name, value = sys.argv[1:]
+try:
+    parsed = float(value)
+except ValueError:
+    raise SystemExit(f"install-local.sh: {name} must be a positive number, got {value!r}")
+if parsed <= 0:
+    raise SystemExit(f"install-local.sh: {name} must be a positive number, got {value!r}")
+PY
+}
+
+assert_loopback_control_host() {
+  case "$(lower "$CONTROL_HOST")" in
+    127.0.0.1|localhost|::1) ;;
+    *)
+      fail "CONTROL_HOST must stay loopback-only. Use 127.0.0.1, localhost, or ::1."
+      ;;
+  esac
+}
+
+assert_hammerspoon_install_mode() {
+  case "$HSM_INSTALL_MODE" in
+    include|overwrite) ;;
+    *)
+      fail "HAMMERSPOON_INSTALL_MODE must be include or overwrite."
+      ;;
+  esac
+}
+
+cleanup_matching_whisper_servers() {
+  local pids pid command server_name model_name
+  server_name="$(basename "$WHISPER_SERVER_BINARY")"
+  model_name="$(basename "$WHISPER_MODEL_PATH")"
+  pids="$(/usr/sbin/lsof -nP -iTCP:"$WHISPER_SERVER_PORT" -sTCP:LISTEN -t 2>/dev/null || true)"
+  [[ -n "$pids" ]] || return 0
+
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    command="$(/bin/ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ -n "$command" ]] || continue
+    if { [[ "$command" == *"$WHISPER_SERVER_BINARY"* ]] || [[ "$command" == *"/$server_name"* ]]; } \
+      && { [[ "$command" == *"$WHISPER_MODEL_PATH"* ]] || [[ "$command" == *"/$model_name"* ]]; } \
+      && [[ "$command" == *"--port $WHISPER_SERVER_PORT"* ]]; then
+      echo "Stopping stale whisper-server pid $pid on port $WHISPER_SERVER_PORT"
+      kill "$pid" >/dev/null 2>&1 || true
+      for _ in {1..20}; do
+        kill -0 "$pid" >/dev/null 2>&1 || break
+        sleep 0.05
+      done
+      if kill -0 "$pid" >/dev/null 2>&1; then
+        kill -9 "$pid" >/dev/null 2>&1 || true
+      fi
+    else
+      fail "Port $WHISPER_SERVER_PORT is already used by another process: $command"
+    fi
+  done <<< "$pids"
+}
+
+install_hammerspoon_config() {
+  local backed_up=false
+  local loader
+  loader='
+-- whisper-maxxing dictation
+local whisperDictationConfig = os.getenv("HOME") .. "/.hammerspoon/whisper-dictation.lua"
+if hs.fs.attributes(whisperDictationConfig) then
+  dofile(whisperDictationConfig)
+end'
+  case "$HSM_INSTALL_MODE" in
+    overwrite)
+      if [[ -f "$HSM_TARGET" ]]; then
+        cp "$HSM_TARGET" "$HSM_BACKUP"
+        backed_up=true
+      fi
+      cp "$ROOT/hammerspoon/init.lua" "$HSM_TARGET"
+      echo "Updated Hammerspoon config at $HSM_TARGET"
+      [[ "$backed_up" == "true" ]] && echo "Backup saved at $HSM_BACKUP"
+      ;;
+    include)
+      cp "$ROOT/hammerspoon/init.lua" "$HSM_INCLUDE_TARGET"
+      if [[ -f "$HSM_TARGET" ]]; then
+        cp "$HSM_TARGET" "$HSM_BACKUP"
+        backed_up=true
+      else
+        : > "$HSM_TARGET"
+      fi
+
+      if cmp -s "$ROOT/hammerspoon/init.lua" "$HSM_TARGET"; then
+        printf '%s\n' "$loader" > "$HSM_TARGET"
+      elif ! grep -q 'whisper-dictation.lua' "$HSM_TARGET"; then
+        printf '%s\n' "$loader" >> "$HSM_TARGET"
+      fi
+
+      echo "Installed Hammerspoon include at $HSM_INCLUDE_TARGET"
+      echo "Ensured guarded loader in $HSM_TARGET"
+      [[ "$backed_up" == "true" ]] && echo "Backup saved at $HSM_BACKUP"
+      ;;
+  esac
+}
+
 read_existing_config_value() {
   local key="$1"
   python3 - "$CONFIG_PATH" "$key" <<'PY'
@@ -146,11 +264,18 @@ for raw in lines:
 PY
 }
 
-WHISPER_CPP_ROOT="$(resolve_whisper_cpp_root)"
+WHISPER_CPP_ROOT="$(canonical_path "$(resolve_whisper_cpp_root)")"
 WHISPER_SERVER_BINARY="${WHISPER_SERVER_BINARY:-$WHISPER_CPP_ROOT/build/bin/whisper-server}"
 WHISPER_CLI_BINARY="${WHISPER_CLI_BINARY:-$WHISPER_CPP_ROOT/build/bin/whisper-cli}"
 WHISPER_MODEL_PATH="$(resolve_model_path "$WHISPER_CPP_ROOT")"
 WHISPER_VAD_MODEL_PATH="${WHISPER_VAD_MODEL_PATH:-}"
+
+WHISPER_SERVER_BINARY="$(canonical_path "$WHISPER_SERVER_BINARY")"
+WHISPER_CLI_BINARY="$(canonical_path "$WHISPER_CLI_BINARY")"
+WHISPER_MODEL_PATH="$(canonical_path "$WHISPER_MODEL_PATH")"
+if [[ -n "$WHISPER_VAD_MODEL_PATH" ]]; then
+  WHISPER_VAD_MODEL_PATH="$(canonical_path "$WHISPER_VAD_MODEL_PATH")"
+fi
 
 if [[ -z "$PREFERRED_INPUT_DEVICE" ]]; then
   PREFERRED_INPUT_DEVICE="$(read_existing_config_value preferredInputDevice || true)"
@@ -168,6 +293,11 @@ fi
 
 assert_bool "$WARM_SERVER_ON_LAUNCH"
 assert_bool "$ENFORCE_PREFERRED_INPUT_DEVICE"
+assert_bool "$PERSIST_RECENT_CAPTURES"
+assert_positive_number "SERVER_REQUEST_TIMEOUT_SECONDS" "$SERVER_REQUEST_TIMEOUT_SECONDS"
+assert_positive_number "CLI_TIMEOUT_SECONDS" "$CLI_TIMEOUT_SECONDS"
+assert_loopback_control_host
+assert_hammerspoon_install_mode
 
 export ROOT CACHE_DIR LOG_DIR SALVAGE_DIR
 export CONTROL_HOST CONTROL_PORT WHISPER_SERVER_HOST WHISPER_SERVER_PORT
@@ -175,6 +305,7 @@ export PREBUFFER_MILLISECONDS AUDIO_BUFFER_SIZE_FRAMES POLL_INTERVAL_MILLISECOND
 export WARM_SERVER_ON_LAUNCH WHISPER_THREADS PREFERRED_INPUT_DEVICE ENFORCE_PREFERRED_INPUT_DEVICE
 export WHISPER_SERVER_BINARY WHISPER_CLI_BINARY WHISPER_MODEL_PATH
 export WHISPER_VAD_MODEL_PATH
+export PERSIST_RECENT_CAPTURES SERVER_REQUEST_TIMEOUT_SECONDS CLI_TIMEOUT_SECONDS
 
 "$ROOT/scripts/build-release.sh"
 
@@ -210,6 +341,9 @@ config = {
     "daemonBinaryPath": os.path.join(os.environ["ROOT"], "bin", "whisper-dictation-daemon"),
     "warmServerOnLaunch": os.environ["WARM_SERVER_ON_LAUNCH"].lower() == "true",
     "whisperThreads": int(os.environ["WHISPER_THREADS"]),
+    "persistRecentCaptures": os.environ["PERSIST_RECENT_CAPTURES"].lower() == "true",
+    "serverRequestTimeoutSeconds": float(os.environ["SERVER_REQUEST_TIMEOUT_SECONDS"]),
+    "cliTimeoutSeconds": float(os.environ["CLI_TIMEOUT_SECONDS"]),
 }
 with open(config_path, "w", encoding="utf-8") as fh:
     json.dump(config, fh, indent=2)
@@ -230,13 +364,10 @@ content = content.replace("__STDERR_PATH__", stderr_path)
 pathlib.Path(output_path).write_text(content, encoding="utf-8")
 PY
 
-if [[ -f "$HSM_TARGET" ]]; then
-  cp "$HSM_TARGET" "$HSM_BACKUP"
-fi
-cp "$ROOT/hammerspoon/init.lua" "$HSM_TARGET"
+install_hammerspoon_config
 
 pkill -f '/whisper-dictation-daemon --config ' >/dev/null 2>&1 || true
-pkill -f '/whisper-server -m ' >/dev/null 2>&1 || true
+cleanup_matching_whisper_servers
 launchctl bootout "gui/$USER_UID/$LAUNCH_AGENT_LABEL" >/dev/null 2>&1 || true
 launchctl bootout "gui/$USER_UID" "$LAUNCH_AGENT_PATH" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$USER_UID" "$LAUNCH_AGENT_PATH"
@@ -252,6 +383,12 @@ fi
 echo "Installed config to $CONFIG_PATH"
 echo "Using whisper.cpp at $WHISPER_CPP_ROOT"
 echo "Using model $WHISPER_MODEL_PATH"
-echo "Updated Hammerspoon config at $HSM_TARGET"
-echo "Backup saved at $HSM_BACKUP"
 echo "Installed LaunchAgent at $LAUNCH_AGENT_PATH"
+echo
+echo "Verify with:"
+echo "  ./bin/whisper-dictation-ctl status"
+echo "  ./bin/whisper-dictation-ctl start && sleep 1 && ./bin/whisper-dictation-ctl stop && ./bin/whisper-dictation-ctl next-result"
+echo
+echo "macOS permissions needed:"
+echo "  System Settings > Privacy & Security > Microphone: allow dictation capture"
+echo "  System Settings > Privacy & Security > Accessibility: allow Hammerspoon to paste text"

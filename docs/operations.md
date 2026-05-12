@@ -1,46 +1,41 @@
 # Operations
 
-## Build
+The README is the primary setup guide. This page is a compact command reference for an installed local stack.
 
-Debug build:
-
-```bash
-swift build -c debug
-```
-
-Release build and copy binaries to `bin/`:
+## Build And Install
 
 ```bash
+swift build
+swift run transcript-quality-tests
 ./scripts/build-release.sh
+WHISPER_CPP_ROOT=~/src/whisper.cpp ./scripts/install-local.sh
 ```
+
+Install-time options that matter most:
+
+- `PREFERRED_INPUT_DEVICE` and `ENFORCE_PREFERRED_INPUT_DEVICE=true`
+- `WHISPER_MODEL_PATH`
+- `WHISPER_VAD_MODEL_PATH`
+- `SERVER_REQUEST_TIMEOUT_SECONDS`, default `30`
+- `CLI_TIMEOUT_SECONDS`, default `90`
+- `PERSIST_RECENT_CAPTURES=true`, opt-in successful audio/transcript retention
+
+`CONTROL_HOST` must remain loopback-only.
 
 ## Health Checks
 
-Daemon status:
-
 ```bash
 ./bin/whisper-dictation-ctl status
-```
-
-Warm the daemon and server:
-
-```bash
 ./bin/whisper-dictation-ctl warmup
-```
-
-Pull the next completed transcript:
-
-```bash
+./bin/whisper-dictation-ctl start
+sleep 1
+./bin/whisper-dictation-ctl stop
 ./bin/whisper-dictation-ctl next-result
 ```
 
+Expected status: `ok:true`, `engineReady:true`, `serverState:"ready"`, and a full prebuffer.
+
 ## LaunchAgent
-
-Installed plist:
-
-- `~/Library/LaunchAgents/com.hansenhomeai.whisper-dictation.plist`
-
-Useful commands:
 
 ```bash
 launchctl print gui/$(id -u)/com.hansenhomeai.whisper-dictation
@@ -49,62 +44,20 @@ launchctl bootout gui/$(id -u)/com.hansenhomeai.whisper-dictation
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hansenhomeai.whisper-dictation.plist
 ```
 
-## Logs
+## Logs And Artifacts
 
-Default log paths:
+- LaunchAgent stderr: `~/Library/Logs/WhisperDictation/launch-agent.stderr.log`
+- LaunchAgent stdout: `~/Library/Logs/WhisperDictation/launch-agent.stdout.log`
+- Whisper server log: `~/Library/Logs/WhisperDictation/whisper-server.log`
+- Failed or low-confidence salvage: `~/Documents/WhisperSalvage`
+- Optional successful recent captures: `~/Documents/WhisperSalvage/recent`
 
-- `~/Library/Logs/WhisperDictation/daemon.log`
-- `~/Library/Logs/WhisperDictation/whisper-server.log`
-- `~/Library/Logs/WhisperDictation/launch-agent.stdout.log`
-- `~/Library/Logs/WhisperDictation/launch-agent.stderr.log`
-
-## Benchmarking
-
-Startup benchmark:
+## Benchmarks
 
 ```bash
 ITERATIONS=12 ./scripts/benchmark-startup.sh
-```
-
-Pipeline benchmark:
-
-```bash
 COUNT=5 ./scripts/benchmark-pipeline.sh
-```
-
-Pipeline benchmark with synthetic CPU load:
-
-```bash
 LOAD=1 COUNT=5 ./scripts/benchmark-pipeline.sh
 ```
 
-## Troubleshooting
-
-### No transcript appears
-
-- check `./bin/whisper-dictation-ctl status`
-- check that `serverState` becomes `ready`
-- check `whisper-server.log`
-
-### Wrong microphone
-
-- set `PREFERRED_INPUT_DEVICE`
-- set `ENFORCE_PREFERRED_INPUT_DEVICE=true`
-- rerun `./scripts/install-local.sh`
-
-### Hammerspoon hotkey does nothing
-
-- confirm `~/.hammerspoon/init.lua` was installed from this repo
-- open Hammerspoon Console
-- run `hs.reload()`
-
-### Daemon or server duplicated
-
-The installer already cleans up stray daemon and `whisper-server` processes before reinstalling.
-
-If you need to clean them manually:
-
-```bash
-pkill -f '/whisper-dictation-daemon --config ' || true
-pkill -f '/whisper-server -m ' || true
-```
+`scripts/benchmark-current.sh` compares old-style fresh process timings against a resident server and accepts `WHISPER_CPP_ROOT`, `WHISPER_MODEL_PATH`, and `FFMPEG` overrides.

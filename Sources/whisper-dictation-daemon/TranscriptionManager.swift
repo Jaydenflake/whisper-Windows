@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 import WhisperDictationCore
 
 private struct PendingTranscription {
@@ -35,7 +36,9 @@ private struct TranscriptDiagnostic {
 private enum TranscriptionError: LocalizedError {
     case serverHTTPError(Int)
     case serverNoResponse
+    case serverTimedOut(Double)
     case cliFailed(String)
+    case cliTimedOut(Double)
     case lowConfidence(String)
     case captureIncomplete(String)
     case combined(server: Error, cli: Error)
@@ -46,8 +49,12 @@ private enum TranscriptionError: LocalizedError {
             return "whisper-server returned HTTP \(statusCode)"
         case .serverNoResponse:
             return "No response body from whisper-server"
+        case .serverTimedOut(let seconds):
+            return "whisper-server timed out after \(Int(seconds)) seconds"
         case .cliFailed(let details):
             return details
+        case .cliTimedOut(let seconds):
+            return "whisper-cli timed out after \(Int(seconds)) seconds"
         case .lowConfidence(let details):
             return details
         case .captureIncomplete(let details):
@@ -128,10 +135,7 @@ final class TranscriptionManager: @unchecked Sendable {
 
     func stop() {
         queue.sync {
-            if let serverProcess, serverProcess.isRunning {
-                serverProcess.terminate()
-                serverProcess.waitUntilExit()
-            }
+            terminateServerProcess()
             self.serverProcess = nil
             self.serverState = .stopped
         }
@@ -316,12 +320,14 @@ final class TranscriptionManager: @unchecked Sendable {
         queueWaitMs: Double
     ) -> SessionResultPayload {
         let salvagePath = diagnostic.flatMap { self.persistSalvage(for: pending, transcriptDiagnostic: $0) }
-        persistRecentCapture(
-            for: pending,
-            transcript: text,
-            transcriptionMode: transcriptionMode,
-            assessment: assessment
-        )
+        if config.persistRecentCaptures {
+            persistRecentCapture(
+                for: pending,
+                transcript: text,
+                transcriptionMode: transcriptionMode,
+                assessment: assessment
+            )
+        }
 
         return completedResult(
             for: pending.capture,
@@ -584,10 +590,12 @@ final class TranscriptionManager: @unchecked Sendable {
     }
 
     private func ensureServerReady(timeout: TimeInterval) throws {
-        if isServerHealthySync() {
+        if let serverProcess, serverProcess.isRunning, isServerHealthySync() {
             serverState = .ready
             return
         }
+
+        try cleanupConflictingServerProcesses()
 
         if serverProcess == nil || serverProcess?.isRunning == false {
             try launchServer()
@@ -633,12 +641,10 @@ final class TranscriptionManager: @unchecked Sendable {
     }
 
     private func restartServer() throws {
-        if let serverProcess, serverProcess.isRunning {
-            serverProcess.terminate()
-            serverProcess.waitUntilExit()
-        }
+        terminateServerProcess()
         self.serverProcess = nil
         serverState = .stopped
+        try cleanupConflictingServerProcesses()
         try ensureServerReady(timeout: 15.0)
     }
 
@@ -652,6 +658,10 @@ final class TranscriptionManager: @unchecked Sendable {
                 useVAD: useVAD
             )
         } catch {
+            fputs(
+                "whisper-dictation-daemon: server transcription failed; restarting server once (\(error.localizedDescription))\n",
+                stderr
+            )
             try restartServer()
             return try transcribeViaServer(
                 wavData: pending.wavData,
@@ -667,6 +677,7 @@ final class TranscriptionManager: @unchecked Sendable {
             url: URL(string: "http://\(config.whisperServerHost):\(config.whisperServerPort)/inference")!
         )
         request.httpMethod = "POST"
+        request.timeoutInterval = config.serverRequestTimeoutSeconds
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
 
         var body = Data()
@@ -705,14 +716,21 @@ final class TranscriptionManager: @unchecked Sendable {
         let semaphore = DispatchSemaphore(value: 0)
         let responseBox = URLRequestResponseBox()
 
-        URLSession.shared.dataTask(with: request) { data, response, error in
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
             responseBox.data = data
             responseBox.error = error
             responseBox.statusCode = (response as? HTTPURLResponse)?.statusCode
             semaphore.signal()
-        }.resume()
+        }
+        task.resume()
 
-        semaphore.wait()
+        let waitResult = semaphore.wait(
+            timeout: .now() + .milliseconds(Int((config.serverRequestTimeoutSeconds + 1.0) * 1000.0))
+        )
+        if waitResult == .timedOut {
+            task.cancel()
+            throw TranscriptionError.serverTimedOut(config.serverRequestTimeoutSeconds)
+        }
 
         if let responseError = responseBox.error {
             throw responseError
@@ -760,7 +778,15 @@ final class TranscriptionManager: @unchecked Sendable {
         process.standardError = stderrPipe
 
         try process.run()
-        process.waitUntilExit()
+        let deadline = Date().addingTimeInterval(config.cliTimeoutSeconds)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        if process.isRunning {
+            terminateProcess(process, timeoutSeconds: 1.0)
+            throw TranscriptionError.cliTimedOut(config.cliTimeoutSeconds)
+        }
 
         let stdout = String(
             data: stdoutPipe.fileHandleForReading.readDataToEndOfFile(),
@@ -781,6 +807,135 @@ final class TranscriptionManager: @unchecked Sendable {
         }
 
         return normalizeTranscript(stdout)
+    }
+
+    private func cleanupConflictingServerProcesses() throws {
+        let processes = listeningProcesses(on: config.whisperServerPort)
+        guard !processes.isEmpty else {
+            return
+        }
+
+        let currentPID = serverProcess?.isRunning == true ? serverProcess?.processIdentifier : nil
+        for process in processes {
+            if let currentPID, process.pid == currentPID {
+                continue
+            }
+
+            guard isExpectedServerCommand(process.command) else {
+                throw NSError(
+                    domain: "WhisperDictation",
+                    code: 4,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Port \(config.whisperServerPort) is already used by another process: \(process.command)"
+                    ]
+                )
+            }
+
+            fputs(
+                "whisper-dictation-daemon: terminating stale whisper-server pid=\(process.pid)\n",
+                stderr
+            )
+            Darwin.kill(process.pid, SIGTERM)
+            waitForExit(pid: process.pid, timeoutSeconds: 1.0)
+            if processIsRunning(pid: process.pid) {
+                Darwin.kill(process.pid, SIGKILL)
+                waitForExit(pid: process.pid, timeoutSeconds: 0.5)
+            }
+        }
+    }
+
+    private func listeningProcesses(on port: Int) -> [(pid: pid_t, command: String)] {
+        guard let pidOutput = runCommandOutput(
+            executable: "/usr/sbin/lsof",
+            arguments: ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
+        ) else {
+            return []
+        }
+
+        return pidOutput
+            .split(whereSeparator: \.isNewline)
+            .compactMap { pid_t(String($0)) }
+            .compactMap { pid in
+                guard let command = runCommandOutput(
+                    executable: "/bin/ps",
+                    arguments: ["-p", String(pid), "-o", "command="]
+                )?.trimmingCharacters(in: .whitespacesAndNewlines),
+                    !command.isEmpty
+                else {
+                    return nil
+                }
+                return (pid: pid, command: command)
+            }
+    }
+
+    private func isExpectedServerCommand(_ command: String) -> Bool {
+        let serverName = URL(fileURLWithPath: config.whisperServerBinary).lastPathComponent
+        let modelName = URL(fileURLWithPath: config.whisperModelPath).lastPathComponent
+        let matchesBinary = command.contains(config.whisperServerBinary) || command.contains("/\(serverName)")
+        let matchesModel = command.contains(config.whisperModelPath) || command.contains("/\(modelName)")
+
+        return matchesBinary
+            && matchesModel
+            && command.contains("--port \(config.whisperServerPort)")
+    }
+
+    private func terminateServerProcess() {
+        guard let serverProcess, serverProcess.isRunning else {
+            return
+        }
+        terminateProcess(serverProcess, timeoutSeconds: 2.0)
+    }
+
+    private func terminateProcess(_ process: Process, timeoutSeconds: TimeInterval) {
+        process.terminate()
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning {
+            Darwin.kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+    }
+
+    private func runCommandOutput(executable: String, arguments: [String]) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+
+        let deadline = Date().addingTimeInterval(2.0)
+        while process.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if process.isRunning {
+            terminateProcess(process, timeoutSeconds: 0.5)
+            return nil
+        }
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func waitForExit(pid: pid_t, timeoutSeconds: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeoutSeconds)
+        while processIsRunning(pid: pid) && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+    }
+
+    private func processIsRunning(pid: pid_t) -> Bool {
+        Darwin.kill(pid, 0) == 0
     }
 
     private func materializeWAV(for pending: PendingTranscription) throws -> URL {
