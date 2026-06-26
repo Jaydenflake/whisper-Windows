@@ -2,6 +2,8 @@
 
 Low-latency local dictation for macOS. `whisper-maxxing` keeps audio capture and `whisper.cpp` warm so hotkey dictation starts immediately, preserves the first words with a rolling prebuffer, and pastes completed transcripts through Hammerspoon.
 
+This repo also includes a Windows port under `windows/`. The Windows version is a Python hotkey dictation script that records from the microphone, transcribes with local `whisper.cpp` `whisper-cli.exe`, then copies and pastes the transcript into the active app. See [docs/windows.md](docs/windows.md).
+
 ## What You Get
 
 - native Swift capture daemon managed by `launchd`
@@ -15,6 +17,8 @@ Low-latency local dictation for macOS. `whisper-maxxing` keeps audio capture and
 
 ## Requirements
 
+For the original macOS daemon:
+
 - macOS 14 or later
 - Xcode command line tools with Swift 6 support
 - [Hammerspoon](https://www.hammerspoon.org/)
@@ -24,6 +28,27 @@ Low-latency local dictation for macOS. `whisper-maxxing` keeps audio capture and
   - a model such as `models/ggml-small.en.bin`
 
 This repo does not vendor `whisper.cpp` or model files.
+
+For Windows:
+
+- Windows 10 or later
+- Python 3.10 or later
+- `whisper.cpp` with `whisper-cli.exe`
+- a model such as `ggml-small.en.bin`
+
+Install with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 `
+  -WhisperCppRoot C:\src\whisper.cpp `
+  -WhisperModelPath C:\src\whisper.cpp\models\ggml-small.en.bin
+```
+
+Run with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\start-windows-dictation.ps1
+```
 
 ## Build `whisper.cpp`
 
@@ -128,8 +153,11 @@ By default, successful dictations are not saved after completion. Failed or low-
 - `Sources/whisper-dictation-daemon`: capture daemon and transcription queue
 - `Sources/whisper-dictation-ctl`: control CLI used by Hammerspoon and scripts
 - `hammerspoon/init.lua`: repo-managed Hammerspoon dictation module
+- `windows/whisper_dictation.py`: Windows hotkey dictation script
 - `scripts/install-local.sh`: local installer
+- `scripts/install-windows.ps1`: Windows installer
 - `docs/architecture.md`, `docs/operations.md`, `docs/latency-analysis.md`: focused reference notes
+- `docs/windows.md`: Windows setup and troubleshooting
 
 ## License
 

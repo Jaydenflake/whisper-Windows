@@ -5,3 +5,7 @@ benchmark-output/
 .build/
 bin/
 docs/benchmarks/
+__pycache__/
+*.pyc
+.venv/
+venv/
