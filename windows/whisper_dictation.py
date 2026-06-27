@@ -36,13 +36,17 @@ DEFAULT_CHANNELS = 1
 DEFAULT_CONFIG_PATH = Path(os.environ.get("APPDATA", Path.home())) / APP_NAME / "config.json"
 DEFAULT_INPUT_DEVICE_PROBE_SECONDS = 0.35
 
-PREFERRED_INPUT_HOST_APIS = ("Windows WASAPI", "Windows WDM-KS", "MME", "Windows DirectSound")
+PREFERRED_INPUT_HOST_APIS = ("Windows WASAPI", "Windows DirectSound", "MME", "Windows WDM-KS")
 IGNORED_AUTO_INPUT_NAME_PARTS = (
     "mapper",
     "primary sound capture",
     "stereo mix",
     "speaker",
     "output",
+    "microphone array 1 ()",
+    "microphone array 2 ()",
+    "microphone array 3 ()",
+    "input ()",
 )
 
 
