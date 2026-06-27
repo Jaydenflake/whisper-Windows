@@ -446,6 +446,9 @@ class WindowsDictationApp:
         self._paste_and_clear_when_ready = False
         self._controller = keyboard.Controller()
         self._stream: sd.InputStream | None = None
+        self._audio_thread: threading.Thread | None = None
+        self._audio_stop_event = threading.Event()
+        self._audio_device: int | str | None = None
         self._capture_sample_rate = config.sample_rate
         self._last_audio_warning_at = 0.0
         self._overlay = RecordingOverlay()
@@ -485,6 +488,11 @@ class WindowsDictationApp:
         self._work_queue.put(None)
         self._overlay.stop()
         self._stop_server()
+        self._audio_stop_event.set()
+        sd.stop()
+        if self._audio_thread is not None and self._audio_thread.is_alive():
+            self._audio_thread.join(timeout=2.0)
+        self._audio_thread = None
         if self._stream is not None:
             self._stream.stop()
             self._stream.close()
@@ -591,16 +599,16 @@ class WindowsDictationApp:
     def _start_audio_stream(self) -> None:
         resolved = self._resolve_input_device()
         self._capture_sample_rate = resolved.sample_rate
+        self._audio_device = resolved.device
         blocksize = max(1, int(self._capture_sample_rate * self.config.block_milliseconds / 1000))
-        self._stream = sd.InputStream(
-            samplerate=self._capture_sample_rate,
-            channels=self.config.channels,
-            dtype="int16",
-            blocksize=blocksize,
-            device=resolved.device,
-            callback=self._on_audio,
+        self._audio_stop_event.clear()
+        self._audio_thread = threading.Thread(
+            target=self._audio_recording_pump,
+            args=(blocksize,),
+            name="audio-recording-pump",
+            daemon=True,
         )
-        self._stream.start()
+        self._audio_thread.start()
         rate_note = ""
         if self._capture_sample_rate != self.config.sample_rate:
             rate_note = f"; resampling to {self.config.sample_rate} Hz for Whisper"
@@ -721,6 +729,45 @@ class WindowsDictationApp:
                 log(f"Audio input warning: {status}")
 
         samples = np.asarray(indata[:, 0], dtype=np.int16).copy()
+        self._ingest_audio_samples(samples)
+
+    def _audio_recording_pump(self, blocksize: int) -> None:
+        window_seconds = 300
+        window_frames = max(blocksize, int(self._capture_sample_rate * window_seconds))
+        poll_seconds = max(self.config.block_milliseconds / 1000.0, 0.02)
+
+        while not self._audio_stop_event.is_set():
+            try:
+                recording = sd.rec(
+                    window_frames,
+                    samplerate=self._capture_sample_rate,
+                    channels=self.config.channels,
+                    dtype="int16",
+                    device=self._audio_device,
+                    blocking=False,
+                )
+            except Exception as exc:
+                log(f"Audio input failed to start: {exc}")
+                time.sleep(1.0)
+                continue
+
+            started_at = time.monotonic()
+            consumed = 0
+            try:
+                while not self._audio_stop_event.is_set() and consumed < window_frames:
+                    elapsed_frames = int((time.monotonic() - started_at) * self._capture_sample_rate)
+                    available = min(max(elapsed_frames, 0), window_frames)
+
+                    if available > consumed:
+                        samples = np.asarray(recording[consumed:available, 0], dtype=np.int16).copy()
+                        consumed = available
+                        self._ingest_audio_samples(samples)
+
+                    time.sleep(poll_seconds)
+            finally:
+                sd.stop()
+
+    def _ingest_audio_samples(self, samples: np.ndarray) -> None:
         samples = resample_int16_mono(samples, self._capture_sample_rate, self.config.sample_rate)
         if samples.size == 0:
             return
